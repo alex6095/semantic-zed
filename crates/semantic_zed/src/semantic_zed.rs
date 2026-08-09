@@ -9,9 +9,10 @@ use gpui::{
     prelude::*,
 };
 use gpui_tokio::Tokio;
-use language::{Bias, Buffer, BufferEditSource, Point};
+use language::{Bias, Buffer, BufferEditSource, Point, PointUtf16, Unclipped};
 use project::{DirectoryLister, Project};
 use semantic_overleaf::{
+    browser::authenticate_with_browser,
     credentials::CredentialStore,
     http::{Identity, OverleafHttpClient},
     sync::{
@@ -24,9 +25,8 @@ use serde_json::Value;
 use settings::Settings as _;
 use std::{
     collections::HashMap,
-    env, fs,
+    fs,
     path::{Path, PathBuf},
-    process::Command,
     time::{Duration, Instant},
 };
 use theme_settings::ThemeSettings;
@@ -571,7 +571,7 @@ impl PaperPanel {
 
         self.login = LoginState::OpeningBrowser;
         cx.notify();
-        let login_task = cx.background_spawn(async move { login_with_browser() });
+        let login_task = Tokio::spawn_result(cx, login_with_browser());
         self.login_task = cx.spawn_in(window, async move |this, cx| {
             let login = login_task.await;
             this.update_in(cx, |this, window, cx| {
@@ -2008,16 +2008,8 @@ struct PendingDocumentSnapshot {
     origin: &'static str,
 }
 
-#[allow(clippy::disallowed_methods)]
-fn login_with_browser() -> Result<()> {
-    let mut command = overleaf_command();
-    command.args(["login", "--server", OVERLEAF_SERVER]);
-    let status = command
-        .status()
-        .context("opening the secure Overleaf browser login")?;
-    if !status.success() {
-        bail!("The Overleaf browser login did not complete.");
-    }
+async fn login_with_browser() -> Result<()> {
+    authenticate_with_browser(OVERLEAF_SERVER).await?;
     Ok(())
 }
 
@@ -2127,31 +2119,6 @@ fn initialize_local_replica(project_id: &str, root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the runtime shipped inside the app bundle before falling back to a
-/// developer's shell PATH. The old PATH-only lookup could launch a stale
-/// globally-installed CLI, which made the native panel report that a valid
-/// Keychain login was missing even though this build had already authenticated.
-fn overleaf_command() -> Command {
-    if let Some(path) = env::var_os("SEMANTIC_ZED_OVERLEAF_CLI") {
-        return Command::new(path);
-    }
-
-    if let Ok(executable) = env::current_exe() {
-        if let Some(resources) = executable
-            .parent()
-            .and_then(Path::parent)
-            .map(|contents| contents.join("Resources"))
-        {
-            let bundled_cli = resources.join("semantic-zed-overleaf-cli");
-            if bundled_cli.is_file() {
-                return Command::new(bundled_cli);
-            }
-        }
-    }
-
-    Command::new("semantic-zed-overleaf")
-}
-
 fn local_replica_error_message(error: &anyhow::Error) -> String {
     let message = format!("{error:#}");
     if message.contains("Socket disconnected before acknowledgement")
@@ -2198,8 +2165,17 @@ fn apply_presence_markers(
             let overlays = cursors
                 .into_iter()
                 .map(|cursor| {
-                    let point =
-                        snapshot.clip_point(Point::new(cursor.row, cursor.column), Bias::Left);
+                    // Overleaf's CodeMirror client publishes line-relative
+                    // JavaScript string offsets, i.e. UTF-16 code units. Zed's
+                    // `Point` columns are UTF-8 byte offsets, so feeding the
+                    // raw column to `clip_point` moves the caret into or past
+                    // non-ASCII characters. Convert through the native UTF-16
+                    // point API before creating the overlay anchor.
+                    let utf16_point = snapshot.clip_point_utf16(
+                        Unclipped(PointUtf16::new(cursor.row, cursor.column)),
+                        Bias::Left,
+                    );
+                    let point = snapshot.point_utf16_to_point(utf16_point);
                     let anchor = snapshot.anchor_after(point);
                     let participant_index = presence_participant_index(&cursor.client_id);
                     NavigationTargetOverlay {
@@ -2267,7 +2243,8 @@ fn local_cursor_for_editor(
     let document_path = editor_relative_path(editor, root, cx)?;
     let point = editor.update(cx, |editor, cx| {
         let snapshot = editor.display_snapshot(cx);
-        editor.selections.newest::<Point>(&snapshot).head()
+        let point = editor.selections.newest::<Point>(&snapshot).head();
+        snapshot.buffer_snapshot().point_to_point_utf16(point)
     });
     Some(LocalOverleafCursor {
         document_path,
@@ -2415,5 +2392,16 @@ mod tests {
             }
         });
         assert!(!escaping.is_valid());
+    }
+
+    #[test]
+    fn overleaf_cursor_columns_are_utf16_not_utf8_bytes() {
+        let text = language::Rope::from("a한😀z\nsecond".to_string());
+        let overleaf_point = PointUtf16::new(0, 4);
+        let zed_point = text.point_utf16_to_point(overleaf_point);
+
+        // `a` + `한` + `😀` occupy 4 UTF-16 code units but 8 UTF-8 bytes.
+        assert_eq!(zed_point, Point::new(0, 8));
+        assert_eq!(text.point_to_point_utf16(zed_point), overleaf_point);
     }
 }

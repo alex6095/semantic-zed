@@ -29,7 +29,7 @@ sqlez.workspace = true
 sysinfo.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "0.26", features = ["tls12", "ring"], default-features = false }
 url.workspace = true
 uuid.workspace = true
