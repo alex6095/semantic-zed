@@ -1418,19 +1418,14 @@ impl AgentPanel {
                     };
                     let global_fallback =
                         global_last_used_agent.filter(|agent| !is_via_collab || agent.is_native());
-                    let preferred_codex = (!is_via_collab)
-                        .then(|| {
-                            panel
-                                .project
-                                .read(cx)
-                                .agent_server_store()
-                                .read(cx)
-                                .external_agents()
-                                .find(|agent_id| agent_id.as_ref() == CODEX_ID)
-                                .cloned()
-                                .map(|id| Agent::Custom { id })
-                        })
-                        .flatten();
+                    // Agent registry metadata is refreshed asynchronously. Do not wait for
+                    // `external_agents()` here: on a clean profile that collection is still
+                    // empty when the panel is first restored, which used to make the visible
+                    // draft fall back to Zed Agent despite Codex being configured by default.
+                    // The registry-backed server will finish registering before connection.
+                    let preferred_codex = (!is_via_collab).then(|| Agent::Custom {
+                        id: AgentId::from(CODEX_ID),
+                    });
 
                     if let Some(serialized_panel) = &serialized_panel {
                         panel.last_created_entry_kind = serialized_panel.last_created_entry_kind;
@@ -11382,6 +11377,47 @@ mod tests {
             vec![&PathBuf::from("/project_a")],
             "Thread A work_dirs should revert to only /project_a after removing /project_b"
         );
+    }
+
+    #[gpui::test]
+    async fn test_new_workspace_defaults_to_codex_before_registry_refresh(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            // Isolate both the per-workspace state and global last-used agent.
+            cx.set_global(db::AppDatabase::test_new());
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| {
+            workspace.set_random_database_id();
+        });
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let async_cx = cx.update(|window, cx| window.to_async(cx));
+        let panel = AgentPanel::load(workspace.downgrade(), async_cx)
+            .await
+            .expect("panel load should succeed");
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _cx| {
+            assert_eq!(
+                panel.selected_agent,
+                Agent::Custom {
+                    id: AgentId::from(CODEX_ID),
+                },
+                "a clean local workspace should select Codex even before registry metadata arrives"
+            );
+        });
     }
 
     #[gpui::test]
