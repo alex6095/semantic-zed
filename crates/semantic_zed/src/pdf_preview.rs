@@ -21,6 +21,7 @@ use workspace::{
 };
 
 use crate::ToggleOverleafPdf;
+use crate::design::ScientificPalette;
 
 const PDF_PANEL_KEY: &str = "SemanticZedPdfPreviewPanel";
 const PDF_CACHE_PATH: &str = ".semantic-zed/output/output.pdf";
@@ -161,6 +162,7 @@ impl EventEmitter<PanelEvent> for PdfPreviewPanel {}
 
 impl Render for PdfPreviewPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = ScientificPalette::resolve(cx);
         let can_go_back = !self.loading && self.page_index > 0;
         let can_go_forward = !self.loading && self.page_index + 1 < self.page_count;
         let has_pdf = self.pdf_path.is_some();
@@ -171,18 +173,32 @@ impl Render for PdfPreviewPanel {
             .id("semantic-zed-pdf-preview")
             .track_focus(&self.focus_handle)
             .size_full()
-            .bg(cx.theme().colors().editor_background)
+            .bg(palette.canvas)
             .child(
                 h_flex()
                     .justify_between()
                     .px_3()
                     .py_2()
+                    .bg(palette.card)
                     .border_b_1()
-                    .border_color(cx.theme().colors().border_variant)
+                    .border_color(palette.divider)
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(Icon::new(IconName::FileDoc).color(Color::Accent))
+                            .child(
+                                div()
+                                    .w_6()
+                                    .h_6()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .bg(palette.accent_tint)
+                                    .child(
+                                        Icon::new(IconName::FileDoc)
+                                            .size(IconSize::Small)
+                                            .color(Color::Accent),
+                                    ),
+                            )
                             .child(
                                 Label::new("PDF Preview")
                                     .size(LabelSize::Small)
@@ -215,8 +231,9 @@ impl Render for PdfPreviewPanel {
                     .justify_between()
                     .px_3()
                     .py_2()
+                    .bg(palette.card)
                     .border_b_1()
-                    .border_color(cx.theme().colors().border_variant)
+                    .border_color(palette.divider)
                     .child(
                         h_flex()
                             .gap_1()
@@ -251,12 +268,19 @@ impl Render for PdfPreviewPanel {
                     .min_h_0()
                     .overflow_y_scroll()
                     .p_4()
+                    .bg(palette.pdf_surround)
                     .when_some(page, |this, page| {
                         this.child(
-                            div()
-                                .w_full()
-                                .items_center()
-                                .child(img(page).id("semantic-zed-pdf-page").max_w_full().h_auto()),
+                            div().w_full().items_center().child(
+                                div()
+                                    .bg(palette.card)
+                                    .rounded_lg()
+                                    .overflow_hidden()
+                                    .shadow(palette.card_shadow.clone())
+                                    .child(
+                                        img(page).id("semantic-zed-pdf-page").max_w_full().h_auto(),
+                                    ),
+                            ),
                         )
                     })
                     .when(self.rendered_page.is_none(), |this| {

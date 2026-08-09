@@ -32,8 +32,10 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
+mod design;
 mod pdf_preview;
 
+use design::ScientificPalette;
 pub use pdf_preview::PdfPreviewPanel;
 
 const PAPER_PANEL_KEY: &str = "SemanticZedPaperPanel";
@@ -872,6 +874,7 @@ impl PaperPanel {
     }
 
     fn render_new_project_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = ScientificPalette::resolve(cx);
         let settings = ThemeSettings::get_global(cx);
         let input_style = EditorStyle {
             background: cx.theme().colors().editor_background,
@@ -890,11 +893,12 @@ impl PaperPanel {
 
         v_flex()
             .gap_2()
-            .p_2()
-            .bg(cx.theme().colors().surface_background)
+            .p_3()
+            .bg(palette.card)
             .border_1()
-            .border_color(cx.theme().colors().border_variant)
-            .rounded_md()
+            .border_color(palette.divider)
+            .rounded_lg()
+            .shadow(palette.card_shadow)
             .child(
                 Label::new("New blank project")
                     .size(LabelSize::Small)
@@ -956,6 +960,7 @@ impl EventEmitter<PanelEvent> for PaperPanel {}
 
 impl Render for PaperPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = ScientificPalette::resolve(cx);
         let has_root = self.paper_root.is_some();
         let status_text = self.status_text();
         let login_text = self.login.summary();
@@ -1012,7 +1017,7 @@ impl Render for PaperPanel {
                     ),
             );
         }
-        let mut project_rows = v_flex().id("semantic-zed-project-list").gap_1();
+        let mut project_rows = v_flex().id("semantic-zed-project-list").gap_0p5();
         if let Some(detail) = self.projects.detail() {
             project_rows = project_rows.child(
                 Label::new(detail.to_string())
@@ -1047,9 +1052,12 @@ impl Render for PaperPanel {
         for project in projects {
             if previous_bucket != Some(project.bucket_label()) {
                 project_rows = project_rows.child(
-                    Label::new(project.bucket_label())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                    div().px_1().pt_2().pb_1().child(
+                        Label::new(project.bucket_label())
+                            .size(LabelSize::XSmall)
+                            .weight(FontWeight::MEDIUM)
+                            .color(Color::Muted),
+                    ),
                 );
                 previous_bucket = Some(project.bucket_label());
             }
@@ -1061,7 +1069,6 @@ impl Render for PaperPanel {
             project_rows = project_rows.child(
                 ListItem::new(format!("semantic-zed-project-{}", project.id))
                     .spacing(ListItemSpacing::Dense)
-                    .outlined()
                     .rounded()
                     .disabled(disabled)
                     .start_slot(
@@ -1111,16 +1118,29 @@ impl Render for PaperPanel {
             .id("semantic-zed-paper-panel")
             .track_focus(&self.focus_handle)
             .size_full()
-            .p_2()
-            .gap_2()
-            .bg(cx.theme().colors().editor_background)
+            .p_3()
+            .gap_3()
+            .bg(palette.sidebar)
             .child(
                 h_flex()
                     .justify_between()
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(Icon::new(IconName::FileDoc).color(Color::Accent))
+                            .child(
+                                div()
+                                    .w_6()
+                                    .h_6()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .bg(palette.accent_tint)
+                                    .child(
+                                        Icon::new(IconName::FileDoc)
+                                            .size(IconSize::Small)
+                                            .color(Color::Accent),
+                                    ),
+                            )
                             .child(Label::new("Overleaf").weight(FontWeight::SEMIBOLD)),
                     )
                     .child(
@@ -1146,55 +1166,54 @@ impl Render for PaperPanel {
             )
             .child(
                 v_flex()
-                    .gap_1()
-                    .p_2()
-                    .bg(cx.theme().colors().surface_background)
+                    .gap_2()
+                    .p_3()
+                    .bg(palette.card)
                     .border_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .rounded_md()
+                    .border_color(palette.divider)
+                    .rounded_lg()
+                    .shadow(palette.card_shadow.clone())
                     .child(
                         h_flex()
+                            .justify_between()
                             .gap_2()
                             .child(
-                                Icon::new(if connected {
-                                    IconName::Check
-                                } else {
-                                    IconName::CloudDownload
-                                })
-                                .size(IconSize::Small)
-                                .color(if connected {
-                                    Color::Success
-                                } else {
-                                    Color::Muted
-                                }),
+                                h_flex()
+                                    .gap_2()
+                                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(
+                                        if connected {
+                                            cx.theme().status().success
+                                        } else {
+                                            cx.theme().colors().text_muted
+                                        },
+                                    ))
+                                    .child(
+                                        Label::new(if connected {
+                                            "Overleaf connected"
+                                        } else {
+                                            "Connect your Overleaf account"
+                                        })
+                                        .size(LabelSize::Small)
+                                        .weight(FontWeight::MEDIUM),
+                                    ),
                             )
                             .child(
-                                Label::new(if connected {
-                                    "Overleaf connected"
-                                } else {
-                                    "Connect your Overleaf account"
-                                })
-                                .size(LabelSize::Small)
-                                .weight(FontWeight::MEDIUM),
+                                Button::new("semantic-zed-login", login_button_label)
+                                    .style(if connected {
+                                        ButtonStyle::Transparent
+                                    } else {
+                                        ButtonStyle::Tinted(TintColor::Accent)
+                                    })
+                                    .disabled(self.login.is_in_progress())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.login_to_overleaf(window, cx);
+                                    })),
                             ),
                     )
                     .child(
                         Label::new(login_text)
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
-                    )
-                    .child(
-                        Button::new("semantic-zed-login", login_button_label)
-                            .style(if connected {
-                                ButtonStyle::OutlinedGhost
-                            } else {
-                                ButtonStyle::Tinted(TintColor::Accent)
-                            })
-                            .full_width()
-                            .disabled(self.login.is_in_progress())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.login_to_overleaf(window, cx);
-                            })),
                     ),
             )
             .child(
@@ -1233,12 +1252,13 @@ impl Render for PaperPanel {
             )
             .child(
                 v_flex()
-                    .gap_1()
-                    .p_2()
-                    .bg(cx.theme().colors().surface_background)
+                    .gap_2()
+                    .p_3()
+                    .bg(palette.card)
                     .border_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .rounded_md()
+                    .border_color(palette.divider)
+                    .rounded_lg()
+                    .shadow(palette.card_shadow)
                     .child(
                         Label::new("Current replica")
                             .size(LabelSize::XSmall)
@@ -1261,7 +1281,7 @@ impl Render for PaperPanel {
                                 .gap_1()
                                 .pt_1()
                                 .border_t_1()
-                                .border_color(cx.theme().colors().border_variant)
+                                .border_color(palette.divider)
                                 .child(
                                     h_flex()
                                         .justify_between()
