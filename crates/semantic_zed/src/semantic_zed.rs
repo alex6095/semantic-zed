@@ -1044,15 +1044,28 @@ impl PaperPanel {
                     cx.notify();
                 }
             }
-            NativeSyncEvent::DocumentChanged { path, text, .. } => {
+            NativeSyncEvent::DocumentChanged {
+                path,
+                text,
+                materialized,
+                ..
+            } => {
                 self.last_submitted_documents
                     .insert(path.clone(), text.clone());
                 if !self.has_newer_local_document_snapshot(&path, &text) {
-                    // `materialized` is deliberately not used here. An open
-                    // editor can be ahead of its backing file even when this
-                    // event is materialized, so applying the authoritative
-                    // text as a Remote diff is safer than reloading disk.
-                    self.apply_open_document_change_from_remote(&path, text, cx);
+                    if materialized {
+                        // Re-read a remote snapshot that the sync engine has
+                        // already written to disk. This updates Zed's saved
+                        // mtime/version as well as its text, preventing the
+                        // next Cmd-S from reporting its own remote write as a
+                        // conflicting external modification.
+                        self.reload_open_document_from_remote(&path, &text, cx);
+                    } else {
+                        // An open editor owns this snapshot and its backing
+                        // file can still be older. Apply it directly without
+                        // asking Zed to reload stale disk bytes.
+                        self.apply_open_document_change_from_remote(&path, text, cx);
+                    }
                 }
             }
             NativeSyncEvent::PdfChanged { .. } => {
@@ -1094,6 +1107,33 @@ impl PaperPanel {
                 .in_flight_documents
                 .get(path)
                 .is_some_and(|snapshot| snapshot != text)
+    }
+
+    fn reload_open_document_from_remote(
+        &self,
+        document_path: &str,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.paper_root.as_ref() else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace.read(cx).project().clone();
+        for buffer in project.read(cx).opened_buffers(cx) {
+            if buffer_relative_path(&buffer, root, cx).as_deref() != Some(document_path)
+                || buffer.read(cx).text() == text
+            {
+                continue;
+            }
+            let reload = buffer.update(cx, |buffer, cx| buffer.reload_from_remote(cx));
+            cx.spawn(async move |_, _| {
+                let _ = reload.await;
+            })
+            .detach();
+        }
     }
 
     fn apply_open_document_change_from_remote(
