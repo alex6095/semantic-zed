@@ -453,6 +453,7 @@ struct CdpError {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LoginPageState {
     #[serde(default)]
     href: String,
@@ -713,6 +714,20 @@ mod tests {
             "https://accounts.google.com/signin",
             &project_url
         ));
+    }
+
+    #[test]
+    fn login_page_state_accepts_the_cdp_camel_case_payload() {
+        let state: LoginPageState = serde_json::from_value(json!({
+            "href": "https://www.overleaf.com/project",
+            "userId": "test-user",
+            "csrf": "test-csrf"
+        }))
+        .unwrap();
+
+        assert_eq!(state.href, "https://www.overleaf.com/project");
+        assert_eq!(state.user_id, "test-user");
+        assert_eq!(state.csrf, "test-csrf");
     }
 
     #[test]
