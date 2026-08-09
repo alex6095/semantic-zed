@@ -3080,7 +3080,10 @@ impl ThreadView {
     fn activity_bar_bg(&self, cx: &Context<Self>) -> Hsla {
         let editor_bg_color = cx.theme().colors().editor_background;
         let active_color = cx.theme().colors().element_selected;
-        editor_bg_color.blend(active_color.opacity(0.3))
+        // The activity strip is a restrained status surface, not a bright
+        // banner. It should only become recognisably violet when it contains
+        // a plan, edits, or a queued request.
+        editor_bg_color.blend(active_color.opacity(0.18))
     }
 
     pub fn render_activity_bar(
@@ -3139,12 +3142,12 @@ impl ThreadView {
                     .bg(self.activity_bar_bg(cx))
                     .border_1()
                     .border_b_0()
-                    .border_color(cx.theme().colors().border)
-                    .rounded_t_md()
+                    .border_color(cx.theme().colors().border_variant)
+                    .rounded_t_lg()
                     .when(opaque_window, |this| {
                         this.shadow(vec![
-                            gpui::BoxShadow::new(px(1.), px(-1.), gpui::black().opacity(0.12))
-                                .blur_radius(px(2.)),
+                            gpui::BoxShadow::new(px(0.), px(-1.), gpui::black().opacity(0.07))
+                                .blur_radius(px(8.)),
                         ])
                     })
                     .when_some(awaiting_permission, |this, element| this.child(element))
@@ -4340,7 +4343,15 @@ impl ThreadView {
         }
 
         let focus_handle = self.message_editor.focus_handle(cx);
-        let editor_bg_color = cx.theme().colors().editor_background;
+        let colors = cx.theme().colors();
+        let editor_bg_color = colors.editor_background;
+        let composer_bg_color = colors.surface_background;
+        let composer_border_color = colors.border_variant;
+        // Cross-platform windows can be transparent. Keep the composer opaque
+        // everywhere and reserve elevation for opaque windows, where it has a
+        // surface to blend into rather than a dark halo.
+        let opaque_window =
+            cx.theme().window_background_appearance() == gpui::WindowBackgroundAppearance::Opaque;
 
         let editor_expanded = self.editor_expanded;
         let (expand_icon, expand_tooltip) = if editor_expanded {
@@ -4354,15 +4365,17 @@ impl ThreadView {
         let fills_container = !has_messages || editor_expanded;
 
         h_flex()
-            .py_2()
-            .bg(editor_bg_color)
+            .px_3()
+            .pt_2()
+            .pb_3()
+            .bg(composer_bg_color)
             .justify_center()
             .on_action(cx.listener(Self::handle_message_editor_move_up))
             .map(|this| {
                 if has_messages {
                     this.on_action(cx.listener(Self::expand_message_editor))
                         .border_t_1()
-                        .border_color(cx.theme().colors().border)
+                        .border_color(composer_border_color)
                         .when(editor_expanded, |this| this.h(vh(0.8, window)))
                 } else {
                     this.flex_1().size_full()
@@ -4374,11 +4387,21 @@ impl ThreadView {
                     .when(max_content_width.is_none(), |this| this.w_full())
                     .min_w_0()
                     .when(fills_container, |this| this.h_full())
-                    .px_2()
                     .flex_shrink_1()
                     .flex_grow_0()
                     .justify_between()
                     .gap_2()
+                    .when(has_messages, |this| {
+                        this.rounded_lg()
+                            .border_1()
+                            .border_color(composer_border_color)
+                            .bg(editor_bg_color)
+                            .px_2()
+                            .pt_1()
+                            .pb_2()
+                            .when(opaque_window, |this| this.shadow_sm())
+                    })
+                    .when(!has_messages, |this| this.px_2())
                     .child(
                         v_flex()
                             .relative()
