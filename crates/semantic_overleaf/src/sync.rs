@@ -1413,7 +1413,11 @@ impl NativeProjectSync {
                 self.flush_document(&id, origin).await?;
             }
         }
+        let cleared_error = self.last_error.take().is_some();
         self.persist_status()?;
+        if cleared_error {
+            self.emit_status();
+        }
         Ok(())
     }
 
