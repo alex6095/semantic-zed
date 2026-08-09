@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use async_tungstenite::tokio::connect_async;
+use async_tungstenite::tokio::connect_async_with_tls_connector;
 use async_tungstenite::tungstenite::client::IntoClientRequest as _;
 use async_tungstenite::tungstenite::http::HeaderValue;
 use async_tungstenite::tungstenite::{Error as WebSocketError, Message};
@@ -192,9 +192,14 @@ impl SocketIo09Session {
             HeaderValue::from_str(cookies)
                 .map_err(|error| SocketClientError::InvalidHeader(error.to_string()))?,
         );
-        let (stream, _) = tokio::time::timeout(timeout, connect_async(request))
-            .await
-            .map_err(|_| SocketClientError::Timeout("websocket handshake"))??;
+        let tls_connector =
+            tokio_rustls::TlsConnector::from(Arc::new(http_client_tls::tls_config()));
+        let (stream, _) = tokio::time::timeout(
+            timeout,
+            connect_async_with_tls_connector(request, Some(tls_connector)),
+        )
+        .await
+        .map_err(|_| SocketClientError::Timeout("websocket handshake"))??;
 
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
