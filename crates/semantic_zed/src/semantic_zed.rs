@@ -2093,14 +2093,15 @@ fn apply_presence_markers(
                         label: NavigationOverlayLabel {
                             // Keep names out of the text canvas. The matching
                             // color and identity live in the Collaborators card.
-                            text: "│".into(),
+                            text: "".into(),
                             text_color: cx
                                 .theme()
                                 .players()
                                 .color_for_participant(participant_index)
                                 .cursor,
-                            x_offset: gpui::px(-0.5),
+                            x_offset: gpui::Pixels::ZERO,
                             scale_factor: 1.0,
+                            caret_width: Some(gpui::px(1.0)),
                         },
                         covered_text_range: None,
                     }

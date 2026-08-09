@@ -1237,6 +1237,11 @@ pub struct NavigationOverlayLabel {
     pub text_color: Hsla,
     pub x_offset: Pixels,
     pub scale_factor: f32,
+    /// When set, render a pixel-snapped caret at the target position instead
+    /// of shaping `text`. This keeps presence cursors on the exact same glyph
+    /// boundary used by the editor rather than approximating a caret with a
+    /// font glyph.
+    pub caret_width: Option<Pixels>,
 }
 
 #[derive(Default, Debug, Clone, Copy)]

@@ -1264,8 +1264,22 @@ impl EditorElement {
         let label_y = ((label_row.as_f64() - context.scroll_position.y)
             * ScrollPixelOffset::from(context.line_height))
         .into();
-        let label_text_size = (context.editor_font_size * label.scale_factor.max(0.0)).max(px(1.0));
         let origin = context.content_origin + point(label_x, label_y);
+
+        if let Some(caret_width) = label.caret_width {
+            paint_commands.push(NavigationOverlayPaintCommand::Caret(
+                NavigationCaretLayout {
+                    bounds: Bounds {
+                        origin,
+                        size: size(caret_width.max(px(1.0)), context.line_height),
+                    },
+                    color: label.text_color,
+                },
+            ));
+            return;
+        }
+
+        let label_text_size = (context.editor_font_size * label.scale_factor.max(0.0)).max(px(1.0));
 
         let mut element = div()
             .block_mouse_except_scroll()
@@ -5714,8 +5728,13 @@ impl EditorElement {
     ) {
         window.with_element_namespace("navigation_overlays", |window| {
             for command in &mut layout.navigation_overlay_paint_commands {
-                let NavigationOverlayPaintCommand::Label(label) = command;
-                label.element.paint(window, cx);
+                match command {
+                    NavigationOverlayPaintCommand::Label(label) => label.element.paint(window, cx),
+                    NavigationOverlayPaintCommand::Caret(caret) => {
+                        let bounds = window.pixel_snap_bounds(caret.bounds);
+                        window.paint_quad(fill(bounds, caret.color));
+                    }
+                }
             }
         });
     }
@@ -10325,12 +10344,18 @@ pub struct IndentGuideLayout {
 
 enum NavigationOverlayPaintCommand {
     Label(NavigationLabelLayout),
+    Caret(NavigationCaretLayout),
 }
 
 struct NavigationLabelLayout {
     element: AnyElement,
     #[cfg_attr(not(test), allow(dead_code))]
     origin: gpui::Point<Pixels>,
+}
+
+struct NavigationCaretLayout {
+    bounds: Bounds<Pixels>,
+    color: Hsla,
 }
 
 struct NavigationOverlayLayoutContext<'a> {
@@ -10758,6 +10783,7 @@ mod tests {
                 text_color: Hsla::black(),
                 x_offset: Pixels::ZERO,
                 scale_factor: 1.0,
+                caret_width: None,
             },
             covered_text_range,
         }
@@ -10769,6 +10795,20 @@ mod tests {
             .iter()
             .map(|command| match command {
                 NavigationOverlayPaintCommand::Label(label) => label,
+                NavigationOverlayPaintCommand::Caret(_) => {
+                    panic!("expected a label navigation overlay")
+                }
+            })
+            .collect()
+    }
+
+    fn navigation_caret_layouts(state: &EditorLayout) -> Vec<&NavigationCaretLayout> {
+        state
+            .navigation_overlay_paint_commands
+            .iter()
+            .filter_map(|command| match command {
+                NavigationOverlayPaintCommand::Caret(caret) => Some(caret),
+                NavigationOverlayPaintCommand::Label(_) => None,
             })
             .collect()
     }
@@ -11293,6 +11333,42 @@ mod tests {
                     .is_none()
             );
         });
+    }
+
+    #[gpui::test]
+    fn test_navigation_caret_uses_exact_editor_glyph_boundary(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("abc", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let editor = window.root(cx).unwrap();
+
+        editor.update(cx, |editor, cx| {
+            let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+            let target = buffer_snapshot.anchor_after(Point::new(0, 1));
+            let mut overlay = navigation_overlay("", target.clone()..target, None);
+            overlay.label.caret_width = Some(px(1.0));
+            editor.set_navigation_overlays(PRIMARY_NAVIGATION_OVERLAY_KEY, vec![overlay], cx);
+        });
+
+        let style = cx.update(|_, cx| editor.update(cx, |editor, cx| editor.style(cx).clone()));
+        let (_, state) = cx.draw(Default::default(), size(px(320.), px(160.)), |_, _| {
+            EditorElement::new(&editor, style)
+        });
+        let carets = navigation_caret_layouts(&state);
+        assert_eq!(carets.len(), 1);
+
+        let expected_x = state.content_origin.x
+            + editor.update_in(cx, |editor, window, cx| {
+                editor.snapshot(window, cx).x_for_display_point(
+                    DisplayPoint::new(DisplayRow(0), 1),
+                    &editor.text_layout_details(window, cx),
+                )
+            });
+        assert_eq!(carets[0].bounds.origin.x, expected_x);
+        assert_eq!(carets[0].bounds.size.width, px(1.0));
     }
 
     #[gpui::test]
