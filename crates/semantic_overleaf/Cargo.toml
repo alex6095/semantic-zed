@@ -25,10 +25,12 @@ serde_json.workspace = true
 sha2.workspace = true
 similar = "2.7.0"
 sqlez.workspace = true
+sysinfo.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 url.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

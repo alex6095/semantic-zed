@@ -133,6 +133,9 @@ impl CredentialStore {
         Ok(Some(record))
     }
 
+    // Keychain access is a short, explicit platform boundary. Callers run this store off the UI
+    // thread; keeping the credential API synchronous also keeps private-file fallback atomic.
+    #[allow(clippy::disallowed_methods)]
     pub fn delete(&self, server: &str) -> Result<Vec<CredentialBackend>, CredentialError> {
         let mut removed = Vec::new();
         if cfg!(target_os = "macos")
@@ -200,6 +203,7 @@ impl CredentialStore {
         }
     }
 
+    #[allow(clippy::disallowed_methods)]
     fn save_keychain(
         &self,
         server: &str,
@@ -233,6 +237,7 @@ impl CredentialStore {
         }
     }
 
+    #[allow(clippy::disallowed_methods)]
     fn load_keychain(&self, server: &str) -> Result<CredentialRecord, CredentialError> {
         if !cfg!(target_os = "macos") {
             return Err(CredentialError::Keychain(

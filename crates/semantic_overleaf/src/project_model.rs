@@ -172,7 +172,7 @@ impl ProjectModel {
         } else {
             String::new()
         };
-        let old_path = entity.path.clone();
+        let old_path = entity.path;
         self.repath(entity_id, &next_path)?;
         if let Some(entity) = self.by_id.get_mut(entity_id) {
             entity.name = name.into();
@@ -197,7 +197,7 @@ impl ProjectModel {
             .filter(|entity| entity.kind == EntityKind::Folder)
             .ok_or_else(|| ProjectModelError::UnknownParent(parent_folder_id.into()))?;
         let next_path = join_relative(&parent.path, &entity.name)?;
-        let old_path = entity.path.clone();
+        let old_path = entity.path;
         self.repath(entity_id, &next_path)?;
         if let Some(entity) = self.by_id.get_mut(entity_id) {
             entity.parent_id = Some(parent_folder_id.into());

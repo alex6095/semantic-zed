@@ -117,6 +117,8 @@ pub enum ReplicaError {
     InvalidDigest(String),
     #[error("replica record has an unknown kind: {0}")]
     UnknownRecordKind(String),
+    #[error("replica operation does not exist: {0}")]
+    UnknownOperation(String),
 }
 
 pub struct ReplicaStore {
@@ -202,10 +204,18 @@ impl ReplicaStore {
         Ok(())
     }
 
+    pub fn remove_document(&mut self, id: &str) {
+        self.state.documents.remove(id);
+    }
+
     pub fn upsert_file(&mut self, mut file: EntityRecord) -> Result<(), ReplicaError> {
         file.updated_at = now()?;
         self.state.files.insert(file.id.clone(), file);
         Ok(())
+    }
+
+    pub fn remove_file(&mut self, id: &str) {
+        self.state.files.remove(id);
     }
 
     pub fn upsert_directory(&mut self, mut directory: EntityRecord) -> Result<(), ReplicaError> {
@@ -213,6 +223,57 @@ impl ReplicaStore {
         self.state
             .directories
             .insert(directory.id.clone(), directory);
+        Ok(())
+    }
+
+    pub fn remove_directory(&mut self, id: &str) {
+        self.state.directories.remove(id);
+    }
+
+    pub fn begin_operation(&mut self, mut operation: Value) -> Result<String, ReplicaError> {
+        let created_at = now()?;
+        let digest = digest_bytes(format!("{operation}:{created_at}").as_bytes());
+        let id = operation
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                format!(
+                    "{}-{}",
+                    OffsetDateTime::now_utc().unix_timestamp(),
+                    &digest[..12]
+                )
+            });
+        if let Some(object) = operation.as_object_mut() {
+            object.insert("id".into(), Value::String(id.clone()));
+            object
+                .entry("status")
+                .or_insert_with(|| Value::String("planned".into()));
+            object
+                .entry("createdAt")
+                .or_insert_with(|| Value::String(created_at.clone()));
+            object.insert("updatedAt".into(), Value::String(created_at));
+        }
+        self.state.operations.insert(id.clone(), operation);
+        self.persist()?;
+        Ok(id)
+    }
+
+    pub fn update_operation(&mut self, id: &str, patch: Value) -> Result<(), ReplicaError> {
+        let Some(operation) = self.state.operations.get_mut(id) else {
+            return Err(ReplicaError::UnknownOperation(id.into()));
+        };
+        if let (Some(operation), Some(patch)) = (operation.as_object_mut(), patch.as_object()) {
+            operation.extend(patch.clone());
+            operation.insert("updatedAt".into(), Value::String(now()?));
+        }
+        self.persist()?;
+        Ok(())
+    }
+
+    pub fn complete_operation(&mut self, id: &str) -> Result<(), ReplicaError> {
+        self.state.operations.remove(id);
+        self.persist()?;
         Ok(())
     }
 
@@ -699,6 +760,40 @@ mod tests {
             1
         );
         assert_eq!(store.unresolved_conflicts().count(), 0);
+    }
+
+    #[test]
+    fn persists_and_completes_recoverable_operations() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation_id;
+        {
+            let mut store =
+                ReplicaStore::open(directory.path(), "https://overleaf.test/", "paper-1").unwrap();
+            operation_id = store
+                .begin_operation(serde_json::json!({
+                    "id": "replace-1",
+                    "kind": "binary-replace",
+                    "path": "figure.png"
+                }))
+                .unwrap();
+            store
+                .update_operation(
+                    &operation_id,
+                    serde_json::json!({ "status": "verified", "replacementId": "file-2" }),
+                )
+                .unwrap();
+        }
+        {
+            let mut store =
+                ReplicaStore::open(directory.path(), "https://overleaf.test/", "paper-1").unwrap();
+            let operation = &store.state().operations[&operation_id];
+            assert_eq!(operation["status"], "verified");
+            assert_eq!(operation["replacementId"], "file-2");
+            store.complete_operation(&operation_id).unwrap();
+        }
+        let store =
+            ReplicaStore::open(directory.path(), "https://overleaf.test/", "paper-1").unwrap();
+        assert!(store.state().operations.is_empty());
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub enum SocketClientError {
     #[error("invalid WebSocket request header: {0}")]
     InvalidHeader(String),
     #[error("WebSocket transport failed: {0}")]
-    WebSocket(#[from] WebSocketError),
+    WebSocket(Box<WebSocketError>),
     #[error("Socket.IO connection timed out during {0}")]
     Timeout(&'static str),
     #[error("Socket disconnected before acknowledgement")]
@@ -42,6 +42,12 @@ pub enum SocketClientError {
     ActorStopped,
     #[error(transparent)]
     Codec(#[from] SocketIoCodecError),
+}
+
+impl From<WebSocketError> for SocketClientError {
+    fn from(error: WebSocketError) -> Self {
+        Self::WebSocket(Box::new(error))
+    }
 }
 
 #[derive(Debug)]
@@ -175,7 +181,7 @@ impl SocketIo09Session {
         let mut request = websocket_url
             .as_str()
             .into_client_request()
-            .map_err(SocketClientError::WebSocket)?;
+            .map_err(SocketClientError::from)?;
         request.headers_mut().insert(
             "Origin",
             HeaderValue::from_str(&origin)

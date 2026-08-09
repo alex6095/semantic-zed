@@ -1,4 +1,6 @@
-use serde_json::{Map, Value, json};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::ot::{OtError, byte_index_for_utf16, utf16_len};

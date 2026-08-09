@@ -413,6 +413,10 @@ fn spawn_event_bridge(
             }
             let _ = events.send(RealtimeEvent { name, args });
         }
+        let _ = events.send(RealtimeEvent {
+            name: "disconnect".into(),
+            args: Vec::new(),
+        });
     })
 }
 
