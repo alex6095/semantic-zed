@@ -1,10 +1,14 @@
 use anyhow::{Context as _, Result, anyhow, bail};
-use editor::{Editor, EditorElement, EditorStyle};
+use editor::{
+    Editor, EditorElement, EditorStyle, NavigationOverlayKey, NavigationOverlayLabel,
+    NavigationTargetOverlay,
+};
 use gpui::{
     App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
     PathPromptOptions, Styled, Subscription, Task, TextStyle, WeakEntity, Window, actions,
     prelude::*,
 };
+use language::{Bias, Point};
 use project::{DirectoryLister, Project};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -36,7 +40,13 @@ const PAPER_PANEL_KEY: &str = "SemanticZedPaperPanel";
 const PROJECT_METADATA_PATH: &str = ".semantic-zed/project.json";
 const RUNTIME_METADATA_PATH: &str = ".semantic-zed/runtime.json";
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+const PRESENCE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const OVERLEAF_SERVER: &str = "https://www.overleaf.com/";
+
+enum OverleafPresenceOverlay {}
+
+const OVERLEAF_PRESENCE_OVERLAY_KEY: NavigationOverlayKey =
+    NavigationOverlayKey::unique::<OverleafPresenceOverlay>();
 
 actions!(
     semantic_zed,
@@ -106,6 +116,7 @@ pub struct PaperPanel {
     task: Task<()>,
     login_task: Task<()>,
     projects_task: Task<()>,
+    presence_task: Task<()>,
     workspace: WeakEntity<Workspace>,
     projects: ProjectListState,
     initializing_project: Option<String>,
@@ -113,6 +124,7 @@ pub struct PaperPanel {
     new_project_editor: Entity<Editor>,
     show_new_project_form: bool,
     creating_project: bool,
+    presence: Vec<OverleafPresence>,
     subscriptions: Vec<Subscription>,
 }
 
@@ -134,6 +146,7 @@ impl PaperPanel {
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         let project = workspace.project().clone();
+        let workspace_entity = cx.entity();
         let new_project_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Project name", window, cx);
@@ -147,6 +160,7 @@ impl PaperPanel {
             task: Task::ready(()),
             login_task: Task::ready(()),
             projects_task: Task::ready(()),
+            presence_task: Task::ready(()),
             workspace: workspace_handle,
             projects: ProjectListState::NotConnected,
             initializing_project: None,
@@ -154,11 +168,13 @@ impl PaperPanel {
             new_project_editor,
             show_new_project_form: false,
             creating_project: false,
+            presence: Vec::new(),
             subscriptions: Vec::new(),
         });
 
         panel.update(cx, |panel, cx| {
             panel.subscribe_to_project(&project, window, cx);
+            panel.subscribe_to_workspace(&workspace_entity, window, cx);
             panel.refresh_from_project(&project, window, cx);
             panel.refresh_login_from_credentials(window, cx);
         });
@@ -228,9 +244,27 @@ impl PaperPanel {
         ));
     }
 
+    fn subscribe_to_workspace(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.subscriptions.push(cx.subscribe_in(
+            workspace,
+            window,
+            |this, _, event: &workspace::Event, window, cx| {
+                if matches!(event, workspace::Event::ActiveItemChanged) {
+                    this.schedule_presence_markers(window, cx);
+                }
+            },
+        ));
+    }
+
     fn refresh_current_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.paper_root.clone() else {
             self.status = PaperStatus::Unavailable;
+            self.clear_presence(window, cx);
             cx.notify();
             return;
         };
@@ -240,8 +274,14 @@ impl PaperPanel {
         let status_task = cx.background_spawn(async move { query_status(&root) });
         self.task = cx.spawn_in(window, async move |this, cx| {
             let status = status_task.await;
-            this.update_in(cx, |this, _, cx| {
+            this.update_in(cx, |this, window, cx| {
+                let should_stream = matches!(&status, Ok(status) if status.is_live());
                 this.status = PaperStatus::from_result(status);
+                if should_stream {
+                    this.restart_presence_stream(window, cx);
+                } else {
+                    this.clear_presence(window, cx);
+                }
                 cx.notify();
             })
             .log_err();
@@ -257,8 +297,14 @@ impl PaperPanel {
         let start_task = cx.background_spawn(async move { start_sync_and_query_status(&root) });
         self.task = cx.spawn_in(window, async move |this, cx| {
             let status = start_task.await;
-            this.update_in(cx, |this, _, cx| {
+            this.update_in(cx, |this, window, cx| {
+                let should_stream = matches!(&status, Ok(status) if status.is_live());
                 this.status = PaperStatus::from_result(status);
+                if should_stream {
+                    this.restart_presence_stream(window, cx);
+                } else {
+                    this.clear_presence(window, cx);
+                }
                 cx.notify();
             })
             .log_err();
@@ -541,14 +587,72 @@ impl PaperPanel {
         let Some(root) = self.paper_root.clone() else {
             return;
         };
-        let Some(workspace) = self.workspace.upgrade() else {
+        let workspace = self.workspace.clone();
+        // Revealing a dock panel asks the workspace to inspect all panel
+        // handles, including this PaperPanel. Run after the current button
+        // callback releases its GPUI entity lease to avoid a double-read panic.
+        window.defer(cx, move |window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            workspace.update(cx, |workspace, cx| {
+                workspace.reveal_panel::<PdfPreviewPanel>(window, cx);
+                if let Some(panel) = workspace.panel::<PdfPreviewPanel>(cx) {
+                    panel.update(cx, |panel, cx| panel.open_for_root(root, window, cx));
+                }
+            });
+        });
+    }
+
+    fn clear_presence(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.presence_task = Task::ready(());
+        if !self.presence.is_empty() {
+            self.presence.clear();
+            self.schedule_presence_markers(window, cx);
+        }
+    }
+
+    fn restart_presence_stream(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.paper_root.clone() else {
+            self.clear_presence(window, cx);
             return;
         };
-        workspace.update(cx, |workspace, cx| {
-            workspace.reveal_panel::<PdfPreviewPanel>(window, cx);
-            if let Some(panel) = workspace.panel::<PdfPreviewPanel>(cx) {
-                panel.update(cx, |panel, cx| panel.open_for_root(root, window, cx));
+        let (sender, receiver) = async_channel::bounded(32);
+        let stream_root = root.clone();
+        let stream_task = cx.background_spawn(async move { stream_presence(&stream_root, sender) });
+        self.presence_task = cx.spawn_in(window, async move |this, cx| {
+            while let Ok(presence) = receiver.recv().await {
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        if this.paper_root.as_ref() != Some(&root) || this.presence == presence {
+                            return;
+                        }
+                        this.presence = presence;
+                        this.schedule_presence_markers(window, cx);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
             }
+            stream_task.await.log_err();
+        });
+    }
+
+    fn schedule_presence_markers(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.paper_root.clone() else {
+            return;
+        };
+        let workspace = self.workspace.clone();
+        let presence = self.presence.clone();
+        window.defer(cx, move |_window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            workspace.update(cx, |workspace, cx| {
+                apply_presence_markers(workspace, &root, &presence, cx);
+            });
         });
     }
 
@@ -653,6 +757,7 @@ impl Render for PaperPanel {
 
         let connected = matches!(&self.login, LoginState::Connected);
         let project_count = self.projects.projects().len();
+        let presence_count = self.presence.len();
         let mut project_rows = v_flex().id("semantic-zed-project-list").gap_1();
         if let Some(detail) = self.projects.detail() {
             project_rows = project_rows.child(
@@ -896,6 +1001,16 @@ impl Render for PaperPanel {
                             .color(Color::Muted)
                             .truncate(),
                     )
+                    .when(presence_count > 0, |this| {
+                        this.child(
+                            Label::new(format!(
+                                "{presence_count} Overleaf collaborator{} in the editor",
+                                if presence_count == 1 { "" } else { "s" }
+                            ))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Accent),
+                        )
+                    })
                     .child(
                         h_flex()
                             .gap_1()
@@ -1242,6 +1357,41 @@ impl DaemonStatus {
     fn can_compile(&self) -> bool {
         self.state == "live" && self.conflicts.is_empty() && self.pending == 0
     }
+
+    fn is_live(&self) -> bool {
+        self.state == "live"
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct OverleafPresence {
+    client_id: String,
+    name: String,
+    document_path: String,
+    row: u32,
+    column: u32,
+}
+
+impl OverleafPresence {
+    fn is_valid(&self) -> bool {
+        !self.client_id.is_empty()
+            && !self.document_path.is_empty()
+            && !self.document_path.starts_with('/')
+            && !self
+                .document_path
+                .split('/')
+                .any(|component| component.is_empty() || component == "." || component == "..")
+    }
+
+    fn display_name(&self) -> String {
+        let name = self.name.trim().chars().take(40).collect::<String>();
+        if name.is_empty() {
+            "Overleaf collaborator".to_string()
+        } else {
+            name
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1262,6 +1412,7 @@ struct ControlRequest<'a> {
 
 #[derive(Deserialize)]
 struct ControlResponse {
+    id: Option<Value>,
     result: Option<Value>,
     error: Option<ControlError>,
 }
@@ -1480,18 +1631,205 @@ fn control_request(root: &Path, method: &str, params: Value) -> Result<Value> {
         .context("sending local sync request")?;
     stream.flush().context("flushing local sync request")?;
 
-    let mut response = String::new();
-    BufReader::new(stream)
-        .read_line(&mut response)
-        .context("reading local sync response")?;
-    let response: ControlResponse =
-        serde_json::from_str(&response).context("parsing local sync response")?;
-    if let Some(error) = response.error {
-        bail!("The sync daemon rejected {method}: {}", error.message);
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut line = String::new();
+        if reader
+            .read_line(&mut line)
+            .context("reading local sync response")?
+            == 0
+        {
+            bail!("The sync daemon closed the connection before responding to {method}.");
+        }
+        let response: ControlResponse =
+            serde_json::from_str(&line).context("parsing local sync response")?;
+        if response.id.as_ref() != Some(&Value::String("semantic-zed".to_string())) {
+            // Presence and document notifications share the authenticated
+            // control stream. They may arrive before a compile/status RPC
+            // response and must not be mistaken for an empty response.
+            continue;
+        }
+        if let Some(error) = response.error {
+            bail!("The sync daemon rejected {method}: {}", error.message);
+        }
+        return response
+            .result
+            .ok_or_else(|| anyhow!("The sync daemon returned no result for {method}."));
     }
-    response
-        .result
-        .ok_or_else(|| anyhow!("The sync daemon returned no result for {method}."))
+}
+
+fn stream_presence(
+    root: &Path,
+    sender: async_channel::Sender<Vec<OverleafPresence>>,
+) -> Result<()> {
+    let mut announced_unavailable = false;
+    while !sender.is_closed() {
+        match stream_presence_session(root, &sender) {
+            Ok(()) => return Ok(()),
+            Err(_) if sender.is_closed() => return Ok(()),
+            Err(_) => {
+                if !announced_unavailable {
+                    if sender.send_blocking(Vec::new()).is_err() {
+                        return Ok(());
+                    }
+                    announced_unavailable = true;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stream_presence_session(
+    root: &Path,
+    sender: &async_channel::Sender<Vec<OverleafPresence>>,
+) -> Result<()> {
+    let runtime = read_runtime(&root.join(RUNTIME_METADATA_PATH))?;
+    let address = control_address(&runtime)?;
+    let mut stream = TcpStream::connect_timeout(&address, CONTROL_TIMEOUT)
+        .context("connecting to the local Overleaf presence stream")?;
+    stream
+        .set_read_timeout(Some(PRESENCE_READ_TIMEOUT))
+        .context("setting Overleaf presence read timeout")?;
+    stream
+        .set_write_timeout(Some(CONTROL_TIMEOUT))
+        .context("setting Overleaf presence write timeout")?;
+    let request = ControlRequest {
+        jsonrpc: "2.0",
+        id: "semantic-zed-presence",
+        method: "subscribe",
+        params: json!({}),
+        token: &runtime.token,
+    };
+    serde_json::to_writer(&mut stream, &request)
+        .context("serializing Overleaf presence subscription")?;
+    stream
+        .write_all(b"\n")
+        .context("sending Overleaf presence subscription")?;
+    stream
+        .flush()
+        .context("flushing Overleaf presence subscription")?;
+
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => bail!("The local Overleaf presence stream closed."),
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error).context("reading Overleaf presence stream"),
+        }
+        let message: Value = serde_json::from_str(&line)
+            .context("parsing a local Overleaf presence notification")?;
+        if let Some(presence) = presence_from_control_message(&message)?
+            && sender.send_blocking(presence).is_err()
+        {
+            return Ok(());
+        }
+    }
+}
+
+fn presence_from_control_message(message: &Value) -> Result<Option<Vec<OverleafPresence>>> {
+    let cursors = if message.get("id").and_then(Value::as_str) == Some("semantic-zed-presence") {
+        if let Some(error) = message
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+        {
+            bail!("The sync daemon rejected the presence subscription: {error}");
+        }
+        message
+            .get("result")
+            .and_then(|result| result.get("presence"))
+            .cloned()
+            .unwrap_or_else(|| json!([]))
+    } else if message.get("method").and_then(Value::as_str) == Some("collaborator/changed") {
+        let params = message.get("params").cloned().unwrap_or_else(|| json!([]));
+        params.get("cursors").cloned().unwrap_or(params)
+    } else {
+        return Ok(None);
+    };
+
+    let presence: Vec<OverleafPresence> = serde_json::from_value(cursors)
+        .context("parsing privacy-minimized Overleaf cursor data")?;
+    Ok(Some(
+        presence
+            .into_iter()
+            .filter(OverleafPresence::is_valid)
+            .collect(),
+    ))
+}
+
+fn apply_presence_markers(
+    workspace: &mut Workspace,
+    root: &Path,
+    presence: &[OverleafPresence],
+    cx: &mut Context<Workspace>,
+) {
+    let editors = workspace.items_of_type::<Editor>(cx).collect::<Vec<_>>();
+    for editor in editors {
+        let absolute_path = editor.read(cx).active_buffer(cx).and_then(|buffer| {
+            let buffer = buffer.read(cx);
+            let file = buffer.file()?.as_local()?;
+            Some(file.abs_path(cx).to_path_buf())
+        });
+        let relative_path = absolute_path.and_then(|path| {
+            path.strip_prefix(root)
+                .ok()
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+        });
+        let cursors = presence
+            .iter()
+            .filter(|cursor| relative_path.as_deref() == Some(cursor.document_path.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        editor.update(cx, |editor, cx| {
+            if cursors.is_empty() {
+                editor.clear_navigation_overlays(OVERLEAF_PRESENCE_OVERLAY_KEY, cx);
+                return;
+            }
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let overlays = cursors
+                .into_iter()
+                .map(|cursor| {
+                    let point =
+                        snapshot.clip_point(Point::new(cursor.row, cursor.column), Bias::Left);
+                    let anchor = snapshot.anchor_after(point);
+                    let participant_index = presence_participant_index(&cursor.client_id);
+                    NavigationTargetOverlay {
+                        target_range: anchor.clone()..anchor,
+                        label: NavigationOverlayLabel {
+                            text: format!("▌ {}", cursor.display_name()).into(),
+                            text_color: cx
+                                .theme()
+                                .players()
+                                .color_for_participant(participant_index)
+                                .cursor,
+                            x_offset: gpui::px(-1.0),
+                            scale_factor: 0.82,
+                        },
+                        covered_text_range: None,
+                    }
+                })
+                .collect();
+            editor.set_navigation_overlays(OVERLEAF_PRESENCE_OVERLAY_KEY, overlays, cx);
+        });
+    }
+}
+
+fn presence_participant_index(client_id: &str) -> u32 {
+    client_id.bytes().fold(2_166_136_261, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+    })
 }
 
 fn read_runtime(runtime_path: &Path) -> Result<RuntimeDescriptor> {
@@ -1646,5 +1984,102 @@ mod tests {
         let status = query_status(temporary.path()).expect("query daemon status");
         assert_eq!(status.summary(), "Overleaf live · 0 pending");
         server.join().expect("join control server");
+    }
+
+    #[test]
+    fn ignores_notifications_before_the_matching_control_response() {
+        let temporary = TempDir::new().expect("create temporary paper root");
+        let metadata = temporary.path().join(".semantic-zed");
+        fs::create_dir_all(&metadata).expect("create runtime metadata directory");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
+        let port = listener.local_addr().expect("read listener address").port();
+        fs::write(
+            metadata.join("runtime.json"),
+            format!(r#"{{"host":"127.0.0.1","port":{port},"token":"test-token"}}"#),
+        )
+        .expect("write runtime metadata");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept control connection");
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().expect("clone control stream"))
+                .read_line(&mut request)
+                .expect("read control request");
+            writeln!(
+                stream,
+                r#"{{"jsonrpc":"2.0","method":"collaborator/changed","params":{{"cursors":[]}}}}"#
+            )
+            .expect("write interleaved notification");
+            writeln!(
+                stream,
+                r#"{{"jsonrpc":"2.0","id":"semantic-zed","result":{{"state":"live","documents":{{"pending":0}},"conflicts":[]}}}}"#
+            )
+            .expect("write control response");
+        });
+
+        let status = query_status(temporary.path()).expect("query daemon status");
+        assert_eq!(status.summary(), "Overleaf live · 0 pending");
+        server.join().expect("join control server");
+    }
+
+    #[test]
+    fn parses_initial_and_incremental_overleaf_presence() {
+        let initial = presence_from_control_message(&json!({
+            "jsonrpc": "2.0",
+            "id": "semantic-zed-presence",
+            "result": {
+                "subscribed": true,
+                "presence": [{
+                    "clientId": "remote-1",
+                    "name": "Remote Writer",
+                    "documentPath": "main.tex",
+                    "row": 2,
+                    "column": 7
+                }]
+            }
+        }))
+        .expect("parse initial presence")
+        .expect("initial presence message");
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].document_path, "main.tex");
+        assert_eq!(initial[0].row, 2);
+
+        let updated = presence_from_control_message(&json!({
+            "jsonrpc": "2.0",
+            "method": "collaborator/changed",
+            "params": {
+                "cursors": [{
+                    "clientId": "remote-1",
+                    "name": "Remote Writer",
+                    "documentPath": "sections/results.tex",
+                    "row": 8,
+                    "column": 3
+                }]
+            }
+        }))
+        .expect("parse updated presence")
+        .expect("updated presence message");
+        assert_eq!(updated[0].document_path, "sections/results.tex");
+        assert_eq!(updated[0].column, 3);
+    }
+
+    #[test]
+    fn rejects_presence_paths_that_escape_the_replica() {
+        let presence = presence_from_control_message(&json!({
+            "jsonrpc": "2.0",
+            "method": "collaborator/changed",
+            "params": {
+                "cursors": [{
+                    "clientId": "remote-1",
+                    "name": "Remote Writer",
+                    "documentPath": "../private.tex",
+                    "row": 0,
+                    "column": 0
+                }]
+            }
+        }))
+        .expect("parse presence")
+        .expect("presence notification");
+        assert!(presence.is_empty());
     }
 }

@@ -14,9 +14,11 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+async-channel.workspace = true
 editor.workspace = true
 gpui.workspace = true
 image.workspace = true
+language.workspace = true
 project.workspace = true
 pdfium-render = "0.9.3"
 serde.workspace = true

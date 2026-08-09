@@ -16652,9 +16652,11 @@ name = "semantic_zed"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
  "editor",
  "gpui",
  "image",
+ "language",
  "pdfium-render",
  "project",
  "serde",
