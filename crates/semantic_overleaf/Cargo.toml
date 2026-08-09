@@ -13,8 +13,10 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
+async-tungstenite = { workspace = true, features = ["tokio", "tokio-runtime", "tokio-rustls-manual-roots"] }
 base64.workspace = true
 dirs.workspace = true
+futures.workspace = true
 percent-encoding.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -22,7 +24,7 @@ serde_json.workspace = true
 similar = "2.7.0"
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 url.workspace = true
 
 [dev-dependencies]

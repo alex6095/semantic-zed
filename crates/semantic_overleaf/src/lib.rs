@@ -8,4 +8,6 @@
 pub mod credentials;
 pub mod http;
 pub mod ot;
+pub mod realtime;
+pub mod socket_client;
 pub mod socket_io;

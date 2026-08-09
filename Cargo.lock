@@ -16651,8 +16651,10 @@ checksum = "b12e76d157a900eb52e81bc6e9f3069344290341720e9178cde2407113ac8d89"
 name = "semantic_overleaf"
 version = "0.1.0"
 dependencies = [
+ "async-tungstenite",
  "base64 0.22.1",
  "dirs",
+ "futures 0.3.32",
  "percent-encoding",
  "serde",
  "serde_json",
