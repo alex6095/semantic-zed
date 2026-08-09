@@ -1069,7 +1069,7 @@
     // Whether to show the agent panel button in the status bar.
     "button": true,
     // Where to dock the agent panel. Can be 'left', 'right' or 'bottom'.
-    "dock": "left",
+    "dock": "right",
     // Whether the agent panel should use flexible (proportional) sizing.
     //
     // Default: true
@@ -2779,7 +2779,14 @@
   // Configures context servers for use by the agent.
   "context_servers": {},
   // Configures agent servers available in the agent panel.
-  "agent_servers": {},
+  "agent_servers": {
+    // Codex ACP uses the user's existing Codex/ChatGPT authentication and
+    // does not require a Zed account. Other ACP agents remain available from
+    // the new-thread menu.
+    "codex-acp": {
+      "type": "registry",
+    },
+  },
   "debugger": {
     "stepping_granularity": "line",
     "save_breakpoints": true,

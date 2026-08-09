@@ -1,4 +1,4 @@
-use gpui::{AnyElement, IntoElement, ParentElement, linear_color_stop, linear_gradient};
+use gpui::{AnyElement, IntoElement, ParentElement};
 use smallvec::SmallVec;
 use ui::prelude::*;
 
@@ -26,40 +26,20 @@ impl RenderOnce for AgentPanelOnboardingCard {
         let color = cx.theme().colors();
 
         div().min_w_0().p_2p5().bg(color.editor_background).child(
-            div()
+            v_flex()
+                .relative()
+                .size_full()
                 .min_w_0()
-                .p(px(3.))
-                .rounded_lg()
-                .elevation_2(cx)
-                .bg(color.background.opacity(0.5))
-                .child(
-                    v_flex()
-                        .relative()
-                        .size_full()
-                        .min_w_0()
-                        .px_4()
-                        .py_3()
-                        .gap_2()
-                        .border_1()
-                        .rounded(px(5.))
-                        .border_color(color.text.opacity(0.1))
-                        .bg(color.panel_background)
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .size_full()
-                                .rounded_md()
-                                .overflow_hidden()
-                                .bg(linear_gradient(
-                                    360.,
-                                    linear_color_stop(color.panel_background, 1.0),
-                                    linear_color_stop(color.editor_background, 0.45),
-                                )),
-                        )
-                        .children(self.children),
-                ),
+                .px_4()
+                .py_3()
+                .gap_2()
+                .border_1()
+                .rounded_xl()
+                .border_color(color.border.opacity(0.55))
+                .bg(color.panel_background)
+                .elevation_1(cx)
+                .overflow_hidden()
+                .children(self.children),
         )
     }
 }

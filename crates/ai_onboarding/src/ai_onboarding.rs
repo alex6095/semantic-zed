@@ -165,22 +165,23 @@ impl ZedAiOnboarding {
             .w_full()
             .relative()
             .gap_1()
-            .child(Headline::new("Welcome to Zed AI"))
+            .child(Headline::new("Agent workspace"))
             .child(
-                Label::new("Sign in to try Zed Pro free for 14 days.")
+                Label::new(
+                    "Use Codex or another ACP agent with its existing account. A Zed account is optional.",
+                )
                     .color(Color::Muted)
                     .mb_2(),
             )
-            .child(PlanDefinitions.sign_in_upsell())
             .child(
-                Button::new("sign_in", "Try Zed Pro for Free")
+                Button::new("sign_in", "Use Zed Cloud (optional)")
                     .disabled(signing_in)
                     .full_width()
-                    .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                    .style(ButtonStyle::Outlined)
                     .on_click({
                         let callback = self.sign_in.clone();
                         move |_, window, cx| {
-                            telemetry::event!("Start Trial Clicked", state = "pre-sign-in");
+                            telemetry::event!("Optional Zed Cloud Clicked", state = "pre-sign-in");
                             callback(window, cx)
                         }
                     }),

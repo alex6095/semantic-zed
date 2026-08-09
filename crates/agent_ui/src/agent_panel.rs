@@ -13,7 +13,7 @@ use std::{
 use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::schema::v1 as acp;
-use agent_servers::AgentServer;
+use agent_servers::{AgentServer, CODEX_ID};
 use agent_settings::UserAgentsMd;
 use collections::HashSet;
 use db::kvp::{Dismissable, KeyValueStore};
@@ -1418,6 +1418,19 @@ impl AgentPanel {
                     };
                     let global_fallback =
                         global_last_used_agent.filter(|agent| !is_via_collab || agent.is_native());
+                    let preferred_codex = (!is_via_collab)
+                        .then(|| {
+                            panel
+                                .project
+                                .read(cx)
+                                .agent_server_store()
+                                .read(cx)
+                                .external_agents()
+                                .find(|agent_id| agent_id.as_ref() == CODEX_ID)
+                                .cloned()
+                                .map(|id| Agent::Custom { id })
+                        })
+                        .flatten();
 
                     if let Some(serialized_panel) = &serialized_panel {
                         panel.last_created_entry_kind = serialized_panel.last_created_entry_kind;
@@ -1438,7 +1451,12 @@ impl AgentPanel {
                             .as_ref()
                             .and_then(|p| p.selected_agent.clone())
                             .map(clamp)
-                            .or(global_fallback),
+                            .or(global_fallback)
+                            // Semantic Zed ships Codex ACP as the default that
+                            // does not require a Zed account. A user's serialized
+                            // or last-used choice always wins, and collab
+                            // workspaces remain native.
+                            .or(preferred_codex),
                     };
                     if let Some(agent) = initial_agent {
                         panel.selected_agent = agent;
