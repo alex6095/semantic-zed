@@ -2477,6 +2477,7 @@ fn client_id(value: &Value) -> Option<&str> {
     value
         .get("client_id")
         .or_else(|| value.get("clientId"))
+        .or_else(|| value.get("id"))
         .and_then(Value::as_str)
 }
 
@@ -2501,7 +2502,8 @@ fn presence_from_value(value: &Value, model: &ProjectModel) -> Option<NativePres
     let client_id = client_id(value)?.to_owned();
     let cursor = value
         .get("cursorData")
-        .or_else(|| value.get("cursor_data"))?;
+        .or_else(|| value.get("cursor_data"))
+        .unwrap_or(value);
     let document_id = cursor
         .get("doc_id")
         .or_else(|| cursor.get("docId"))
@@ -2520,7 +2522,8 @@ fn presence_from_value(value: &Value, model: &ProjectModel) -> Option<NativePres
     let name = format!("{first_name} {last_name}").trim().to_owned();
     let name = if name.is_empty() {
         value
-            .get("email")
+            .get("name")
+            .or_else(|| value.get("email"))
             .and_then(Value::as_str)
             .unwrap_or("Overleaf collaborator")
             .to_owned()
@@ -2659,5 +2662,35 @@ mod tests {
         assert_eq!(presence.document_path, "main.tex");
         assert_eq!(presence.name, "Alex Lee");
         assert_eq!((presence.row, presence.column), (4, 9));
+    }
+
+    #[test]
+    fn normalizes_flat_client_updated_presence_events() {
+        let model = ProjectModel::from_project(json!({
+            "rootFolder": [{
+                "_id": "root",
+                "docs": [{ "_id": "doc-1", "name": "main.tex" }],
+                "fileRefs": [],
+                "folders": []
+            }]
+        }))
+        .unwrap();
+        let presence = presence_from_value(
+            &json!({
+                "id": "public-client-1",
+                "user_id": "account-1",
+                "name": "Alex Lee",
+                "email": "alex@example.com",
+                "doc_id": "doc-1",
+                "row": 11,
+                "column": 24
+            }),
+            &model,
+        )
+        .unwrap();
+        assert_eq!(presence.client_id, "public-client-1");
+        assert_eq!(presence.document_path, "main.tex");
+        assert_eq!(presence.name, "Alex Lee");
+        assert_eq!((presence.row, presence.column), (11, 24));
     }
 }
