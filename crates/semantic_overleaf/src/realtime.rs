@@ -522,7 +522,7 @@ mod tests {
         let project = json!({ "rootFolder": [], "name": "Paper" });
         assert_eq!(
             parse_join_project_response(&[json!({
-                "data": { "project": project.clone(), "publicId": "client-1" }
+                "data": { "project": project, "publicId": "client-1" }
             })]),
             Some((project.clone(), Some("client-1".into())))
         );

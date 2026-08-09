@@ -17,14 +17,17 @@ anyhow.workspace = true
 async-channel.workspace = true
 editor.workspace = true
 gpui.workspace = true
+gpui_tokio.workspace = true
 image.workspace = true
 language.workspace = true
 project.workspace = true
 pdfium-render = "0.9.3"
+semantic_overleaf.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 theme_settings.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true

@@ -1576,7 +1576,16 @@ impl Buffer {
 
     /// Reloads the contents of the buffer from disk.
     pub fn reload(&mut self, cx: &Context<Self>) -> oneshot::Receiver<Option<Transaction>> {
-        self.reload_impl(None, cx)
+        self.reload_impl(None, BufferEditSource::User, cx)
+    }
+
+    /// Reloads a collaboration update from disk without adding it to the local user's undo/redo
+    /// history.
+    pub fn reload_from_remote(
+        &mut self,
+        cx: &Context<Self>,
+    ) -> oneshot::Receiver<Option<Transaction>> {
+        self.reload_impl(None, BufferEditSource::Remote, cx)
     }
 
     /// Reloads the contents of the buffer from disk using the specified encoding.
@@ -1588,12 +1597,13 @@ impl Buffer {
         encoding: &'static Encoding,
         cx: &Context<Self>,
     ) -> oneshot::Receiver<Option<Transaction>> {
-        self.reload_impl(Some(encoding), cx)
+        self.reload_impl(Some(encoding), BufferEditSource::User, cx)
     }
 
     fn reload_impl(
         &mut self,
         force_encoding: Option<&'static Encoding>,
+        source: BufferEditSource,
         cx: &Context<Self>,
     ) -> oneshot::Receiver<Option<Transaction>> {
         let (tx, rx) = futures::channel::oneshot::channel();
@@ -1650,10 +1660,12 @@ impl Buffer {
                     this.finalize_last_transaction();
                     let old_encoding = this.encoding;
                     let old_has_bom = this.has_bom;
-                    this.apply_diff(diff, cx);
+                    let transaction_id = this.apply_diff_with_source(diff, source, cx);
                     this.encoding = encoding_used;
                     this.has_bom = has_bom;
-                    let transaction = this.finalize_last_transaction().cloned();
+                    let transaction = transaction_id
+                        .and_then(|transaction_id| this.get_transaction(transaction_id).cloned());
+                    this.finalize_last_transaction();
                     if let Some(ref txn) = transaction {
                         if old_encoding != encoding_used || old_has_bom != has_bom {
                             this.reload_with_encoding_txns
@@ -2382,6 +2394,17 @@ impl Buffer {
     /// calculated, then adjust the diff to account for those changes, and discard any
     /// parts of the diff that conflict with those changes.
     pub fn apply_diff(&mut self, diff: Diff, cx: &mut Context<Self>) -> Option<TransactionId> {
+        self.apply_diff_with_source(diff, BufferEditSource::User, cx)
+    }
+
+    /// Applies a diff while preserving its edit domain. Remote and agent diffs are kept out of
+    /// the local user's undo/redo history by [`Self::end_transaction_with_source`].
+    pub fn apply_diff_with_source(
+        &mut self,
+        diff: Diff,
+        source: BufferEditSource,
+        cx: &mut Context<Self>,
+    ) -> Option<TransactionId> {
         let snapshot = self.snapshot();
         let mut edits_since = snapshot.edits_since::<usize>(&diff.base_version).peekable();
         let mut delta = 0;
@@ -2412,7 +2435,7 @@ impl Buffer {
         self.start_transaction();
         self.text.set_line_ending(diff.line_ending);
         self.edit(adjusted_edits, None, cx);
-        self.end_transaction(cx)
+        self.end_transaction_with_source(source, cx)
     }
 
     pub fn has_unsaved_edits(&self) -> bool {

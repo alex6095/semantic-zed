@@ -45,6 +45,25 @@ pub struct NativeProjectConfig {
 }
 
 impl NativeProjectConfig {
+    pub fn new(project_id: impl Into<String>) -> Result<Self, NativeSyncError> {
+        let project_id = project_id.into();
+        if project_id.trim().is_empty() {
+            return Err(NativeSyncError::InvalidConfig(
+                "projectId must not be empty".into(),
+            ));
+        }
+        Ok(Self {
+            version: default_config_version(),
+            server: default_server(),
+            project_id,
+            scan_interval_ms: default_scan_interval(),
+            adopt_local_on_first_sync: false,
+            allow_binary_writes: default_allow_binary_writes(),
+            created_at: None,
+            initialized_at: None,
+        })
+    }
+
     pub fn load(root: &Path) -> Result<Self, NativeSyncError> {
         let path = root.join(".semantic-zed/project.json");
         let bytes = fs::read(&path).map_err(|error| NativeSyncError::ConfigIo {
@@ -58,6 +77,19 @@ impl NativeProjectConfig {
             ));
         }
         Ok(config)
+    }
+
+    pub fn save(&self, root: &Path) -> Result<(), NativeSyncError> {
+        if self.project_id.trim().is_empty() {
+            return Err(NativeSyncError::InvalidConfig(
+                "projectId must not be empty".into(),
+            ));
+        }
+        let path = root.join(".semantic-zed/project.json");
+        let mut bytes = serde_json::to_vec_pretty(self)?;
+        bytes.push(b'\n');
+        atomic_write(&path, &bytes, 0o644)?;
+        Ok(())
     }
 }
 
@@ -2544,6 +2576,21 @@ mod tests {
         let config = NativeProjectConfig::load(directory.path()).unwrap();
         assert_eq!(config.project_id, "paper-1");
         assert_eq!(config.scan_interval_ms, 500);
+    }
+
+    #[test]
+    fn creates_native_project_metadata_without_a_node_initializer() {
+        let directory = tempfile::tempdir().unwrap();
+        NativeProjectConfig::new("paper-native")
+            .unwrap()
+            .save(directory.path())
+            .unwrap();
+
+        let config = NativeProjectConfig::load(directory.path()).unwrap();
+        assert_eq!(config.project_id, "paper-native");
+        assert_eq!(config.server, "https://www.overleaf.com/");
+        assert_eq!(config.scan_interval_ms, 750);
+        assert!(config.allow_binary_writes);
     }
 
     #[test]

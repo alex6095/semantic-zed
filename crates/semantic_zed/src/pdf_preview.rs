@@ -503,6 +503,9 @@ fn pdfium_library_name() -> Result<&'static str> {
     bail!("PDF preview is unsupported on this operating system.")
 }
 
+// The native preview remains primary. This explicit user-invoked fallback must launch the
+// platform viewer and is already called from a GPUI background task.
+#[allow(clippy::disallowed_methods)]
 fn open_with_system_viewer(path: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     let mut command = Command::new("open");

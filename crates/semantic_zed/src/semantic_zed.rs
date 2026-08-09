@@ -8,15 +8,23 @@ use gpui::{
     PathPromptOptions, Styled, Subscription, Task, TextStyle, WeakEntity, Window, actions,
     prelude::*,
 };
-use language::{Bias, Point};
+use gpui_tokio::Tokio;
+use language::{Bias, Buffer, BufferEditSource, Point};
 use project::{DirectoryLister, Project};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use semantic_overleaf::{
+    credentials::CredentialStore,
+    http::OverleafHttpClient,
+    sync::{
+        NativePresence, NativeProjectConfig, NativeStatus, NativeSyncError, NativeSyncEvent,
+        NativeSyncHandle,
+    },
+};
+use serde::Deserialize;
+use serde_json::Value;
 use settings::Settings as _;
 use std::{
+    collections::HashMap,
     env, fs,
-    io::{BufRead, BufReader, Write},
-    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -40,9 +48,6 @@ pub use pdf_preview::PdfPreviewPanel;
 
 const PAPER_PANEL_KEY: &str = "SemanticZedPaperPanel";
 const PROJECT_METADATA_PATH: &str = ".semantic-zed/project.json";
-const RUNTIME_METADATA_PATH: &str = ".semantic-zed/runtime.json";
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
-const PRESENCE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const CURSOR_UPDATE_THROTTLE: Duration = Duration::from_millis(250);
 const SAVE_COMPILE_DEBOUNCE: Duration = Duration::from_millis(350);
 const OVERLEAF_SERVER: &str = "https://www.overleaf.com/";
@@ -124,6 +129,7 @@ pub struct PaperPanel {
     compile_task: Task<()>,
     save_compile_task: Task<()>,
     cursor_task: Task<()>,
+    document_push_task: Task<()>,
     workspace: WeakEntity<Workspace>,
     projects: ProjectListState,
     initializing_project: Option<String>,
@@ -137,6 +143,10 @@ pub struct PaperPanel {
     pending_cursor: Option<LocalOverleafCursor>,
     last_cursor_sent: Option<LocalOverleafCursor>,
     last_cursor_sent_at: Option<Instant>,
+    native_sync: Option<NativeSyncHandle>,
+    pending_documents: HashMap<String, PendingDocumentSnapshot>,
+    last_submitted_documents: HashMap<String, String>,
+    document_push_worker_running: bool,
     subscriptions: Vec<Subscription>,
 }
 
@@ -176,6 +186,7 @@ impl PaperPanel {
             compile_task: Task::ready(()),
             save_compile_task: Task::ready(()),
             cursor_task: Task::ready(()),
+            document_push_task: Task::ready(()),
             workspace: workspace_handle,
             projects: ProjectListState::NotConnected,
             initializing_project: None,
@@ -189,6 +200,10 @@ impl PaperPanel {
             pending_cursor: None,
             last_cursor_sent: None,
             last_cursor_sent_at: None,
+            native_sync: None,
+            pending_documents: HashMap::default(),
+            last_submitted_documents: HashMap::default(),
+            document_push_worker_running: false,
             subscriptions: Vec::new(),
         });
 
@@ -225,6 +240,7 @@ impl PaperPanel {
         cx: &mut Context<Self>,
     ) {
         if paper_root != self.paper_root {
+            self.reset_native_sync();
             self.reset_cursor_publisher();
         }
         self.paper_root = paper_root;
@@ -239,6 +255,7 @@ impl PaperPanel {
     ) {
         let paper_root = Self::paper_root_for_project(project, cx);
         if paper_root != self.paper_root {
+            self.reset_native_sync();
             self.paper_root = paper_root;
             self.reset_cursor_publisher();
             self.refresh_current_root(window, cx);
@@ -263,6 +280,9 @@ impl PaperPanel {
                         | project::Event::WorktreePathsChanged { .. }
                 ) {
                     this.refresh_from_project(project, window, cx);
+                }
+                if let project::Event::BufferEdited { source } = event {
+                    this.queue_project_document_updates(project, *source, window, cx);
                 }
             },
         ));
@@ -363,6 +383,9 @@ impl PaperPanel {
         let Some(root) = self.paper_root.as_ref() else {
             return;
         };
+        let Some(handle) = self.native_sync.clone() else {
+            return;
+        };
         let Some(cursor) = local_cursor_for_editor(editor, root, cx) else {
             return;
         };
@@ -377,7 +400,7 @@ impl PaperPanel {
         }
 
         self.cursor_worker_running = true;
-        let root = root.clone();
+        let tokio = Tokio::handle(cx);
         self.cursor_task = cx.spawn_in(window, async move |this, cx| {
             loop {
                 let delay = this
@@ -409,15 +432,21 @@ impl PaperPanel {
                     continue;
                 };
                 let cursor_for_request = cursor.clone();
-                let request_root = root.clone();
-                let result = cx
-                    .background_spawn(
-                        async move { publish_cursor(&request_root, &cursor_for_request) },
-                    )
+                let handle = handle.clone();
+                let result = tokio
+                    .spawn(async move {
+                        handle
+                            .update_position(
+                                cursor_for_request.document_path,
+                                cursor_for_request.row,
+                                cursor_for_request.column,
+                            )
+                            .await
+                    })
                     .await;
                 this.update(cx, |this, _| {
                     this.last_cursor_sent_at = Some(Instant::now());
-                    if result.is_ok() {
+                    if result.is_ok_and(|result| result.is_ok()) {
                         this.last_cursor_sent = Some(cursor);
                     }
                 })
@@ -429,6 +458,7 @@ impl PaperPanel {
     fn refresh_current_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.paper_root.clone() else {
             self.status = PaperStatus::Unavailable;
+            self.reset_native_sync();
             self.clear_presence(window, cx);
             cx.notify();
             return;
@@ -436,46 +466,86 @@ impl PaperPanel {
 
         self.status = PaperStatus::Loading;
         cx.notify();
-        let status_task = cx.background_spawn(async move { query_status(&root) });
+        if let Some(handle) = self.native_sync.clone() {
+            let status_task = Tokio::spawn_result(cx, async move {
+                handle.status().await.map_err(anyhow::Error::from)
+            });
+            self.task = cx.spawn_in(window, async move |this, cx| {
+                let status = status_task.await;
+                this.update_in(cx, |this, window, cx| {
+                    this.apply_native_status_result(status, window, cx);
+                })
+                .log_err();
+            });
+            return;
+        }
+
+        let start_task = Tokio::spawn_result(cx, async move {
+            let handle = NativeSyncHandle::start_from_root(root).await?;
+            let status = handle.status().await?;
+            Ok((handle, status))
+        });
         self.task = cx.spawn_in(window, async move |this, cx| {
-            let status = status_task.await;
-            this.update_in(cx, |this, window, cx| {
-                let should_stream = matches!(&status, Ok(status) if status.is_live());
-                this.status = PaperStatus::from_result(status);
-                if should_stream {
-                    this.restart_presence_stream(window, cx);
-                    this.queue_active_cursor(window, cx);
-                } else {
-                    this.clear_presence(window, cx);
+            let result = start_task.await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok((handle, status)) => {
+                    this.native_sync = Some(handle);
+                    this.apply_native_status(status, window, cx);
+                    this.restart_native_event_stream(window, cx);
                 }
-                cx.notify();
+                Err(error) => {
+                    this.status = PaperStatus::Error(error.to_string());
+                    this.clear_presence(window, cx);
+                    cx.notify();
+                }
             })
             .log_err();
         });
     }
 
     fn start_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(root) = self.paper_root.clone() else {
+        if self.paper_root.is_none() {
             return;
-        };
-        self.status = PaperStatus::Loading;
-        cx.notify();
-        let start_task = cx.background_spawn(async move { start_sync_and_query_status(&root) });
-        self.task = cx.spawn_in(window, async move |this, cx| {
-            let status = start_task.await;
-            this.update_in(cx, |this, window, cx| {
-                let should_stream = matches!(&status, Ok(status) if status.is_live());
-                this.status = PaperStatus::from_result(status);
-                if should_stream {
-                    this.restart_presence_stream(window, cx);
-                    this.queue_active_cursor(window, cx);
-                } else {
-                    this.clear_presence(window, cx);
-                }
+        }
+        self.refresh_current_root(window, cx);
+    }
+
+    fn apply_native_status_result(
+        &mut self,
+        result: Result<NativeStatus>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(status) => self.apply_native_status(status, window, cx),
+            Err(error) => {
+                self.status = PaperStatus::Error(error.to_string());
+                self.clear_presence(window, cx);
                 cx.notify();
-            })
-            .log_err();
-        });
+            }
+        }
+    }
+
+    fn apply_native_status(
+        &mut self,
+        status: NativeStatus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_live = status.state == "live";
+        self.presence = status
+            .collaborators
+            .iter()
+            .cloned()
+            .map(OverleafPresence::from)
+            .filter(OverleafPresence::is_valid)
+            .collect();
+        self.status = PaperStatus::Ready(DaemonStatus::from_native(&status));
+        self.schedule_presence_markers(window, cx);
+        if is_live {
+            self.queue_active_cursor(window, cx);
+        }
+        cx.notify();
     }
 
     fn login_to_overleaf(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -529,7 +599,7 @@ impl PaperPanel {
 
         self.projects = ProjectListState::Loading;
         cx.notify();
-        let list_task = cx.background_spawn(async move { list_remote_projects() });
+        let list_task = Tokio::spawn_result(cx, list_remote_projects());
         self.projects_task = cx.spawn_in(window, async move |this, cx| {
             let projects = list_task.await;
             this.update_in(cx, |this, _, cx| {
@@ -576,7 +646,7 @@ impl PaperPanel {
         cx.notify();
         let workspace = self.workspace.clone();
         let project_name = remote_project.name.clone();
-        let project_id = remote_project.id.clone();
+        let project_id = remote_project.id;
         self.projects_task = cx.spawn_in(window, async move |this, cx| {
             let Some(paths) = chooser.await.log_err().flatten() else {
                 this.update_in(cx, |this, _, cx| {
@@ -601,15 +671,6 @@ impl PaperPanel {
                 .await;
             match result {
                 Ok(()) => {
-                    // Bootstrap intentionally stops after it has made a
-                    // durable replica marker. Start the long-lived daemon
-                    // before changing windows so the newly opened workspace
-                    // immediately observes a live session instead of making
-                    // the user press Start sync a second time.
-                    let sync_root = root.clone();
-                    let initial_sync = cx
-                        .background_spawn(async move { start_sync_and_query_status(&sync_root) })
-                        .await;
                     let open_result: Result<()> = async {
                         let workspace = workspace
                             .upgrade()
@@ -631,7 +692,10 @@ impl PaperPanel {
                             this.update_in(cx, |this, _window, cx| {
                                 this.initializing_project = None;
                                 this.paper_root = Some(root);
-                                this.status = PaperStatus::from_result(initial_sync);
+                                // The panel in the opened workspace owns and starts the native
+                                // Rust actor. Keeping ownership with that workspace prevents two
+                                // sync engines from racing over one replica.
+                                this.status = PaperStatus::Loading;
                                 cx.notify();
                             })
                             .log_err();
@@ -698,9 +762,9 @@ impl PaperPanel {
         self.creating_project = true;
         self.project_message = None;
         cx.notify();
-        let create_task = cx.background_spawn({
+        let create_task = Tokio::spawn_result(cx, {
             let name = name.clone();
-            async move { create_remote_project(&name) }
+            async move { create_remote_project(&name).await }
         });
         self.projects_task = cx.spawn_in(window, async move |this, cx| {
             let result = create_task.await;
@@ -750,23 +814,39 @@ impl PaperPanel {
         let Some(root) = self.paper_root.clone() else {
             return;
         };
+        let Some(handle) = self.native_sync.clone() else {
+            return;
+        };
         if !self.status.is_live() {
             return;
         }
+        let open_documents = self
+            .workspace
+            .upgrade()
+            .map(|workspace| {
+                let project = workspace.read(cx).project().clone();
+                open_document_snapshots(&project, &root, cx)
+            })
+            .unwrap_or_default();
         self.status = PaperStatus::Compiling;
         cx.notify();
-        let compile_root = root.clone();
-        let compile_task =
-            cx.background_spawn(async move { compile_and_query_status(&compile_root) });
+        let compile_task = Tokio::spawn_result(cx, async move {
+            for (path, text) in open_documents {
+                match handle.apply_snapshot(path, text, "compile-barrier").await {
+                    Ok(_) | Err(NativeSyncError::UnknownDocument(_)) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            handle.compile(None).await.map_err(anyhow::Error::from)
+        });
         self.compile_task = cx.spawn_in(window, async move |this, cx| {
             let status = compile_task.await;
             this.update_in(cx, |this, window, cx| {
                 let compiled = status.is_ok();
-                this.status = PaperStatus::from_result(status);
+                this.apply_native_status_result(status, window, cx);
                 if compiled {
                     this.refresh_pdf(root, reveal_pdf, window, cx);
                 }
-                cx.notify();
             })
             .log_err();
         });
@@ -814,27 +894,41 @@ impl PaperPanel {
         }
     }
 
-    fn restart_presence_stream(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn restart_native_event_stream(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.paper_root.clone() else {
+            self.clear_presence(window, cx);
+            return;
+        };
+        let Some(handle) = self.native_sync.clone() else {
             self.clear_presence(window, cx);
             return;
         };
         // A new Overleaf socket session has no cursor state, even if the local
         // caret has not moved. Publish it again after every reconnect.
         self.reset_cursor_publisher();
-        let (sender, receiver) = async_channel::bounded(32);
-        let stream_root = root.clone();
-        let stream_task = cx.background_spawn(async move { stream_presence(&stream_root, sender) });
-        self.presence_task = cx.spawn_in(window, async move |this, cx| {
-            while let Ok(presence) = receiver.recv().await {
-                if this
-                    .update_in(cx, |this, window, cx| {
-                        if this.paper_root.as_ref() != Some(&root) || this.presence == presence {
+        let (sender, receiver) = async_channel::bounded(128);
+        let mut native_events = handle.subscribe();
+        let stream_task = Tokio::spawn(cx, async move {
+            loop {
+                match native_events.recv().await {
+                    Ok(event) => {
+                        if sender.send(event).await.is_err() {
                             return;
                         }
-                        this.presence = presence;
-                        this.schedule_presence_markers(window, cx);
-                        cx.notify();
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+        self.presence_task = cx.spawn_in(window, async move |this, cx| {
+            while let Ok(event) = receiver.recv().await {
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        if this.paper_root.as_ref() != Some(&root) {
+                            return;
+                        }
+                        this.handle_native_sync_event(event, window, cx);
                     })
                     .is_err()
                 {
@@ -845,12 +939,193 @@ impl PaperPanel {
         });
     }
 
+    fn handle_native_sync_event(
+        &mut self,
+        event: NativeSyncEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            NativeSyncEvent::StatusChanged { status } => {
+                self.apply_native_status(status, window, cx);
+            }
+            NativeSyncEvent::PresenceChanged { collaborators } => {
+                let presence = collaborators
+                    .into_iter()
+                    .map(OverleafPresence::from)
+                    .filter(OverleafPresence::is_valid)
+                    .collect::<Vec<_>>();
+                if self.presence != presence {
+                    self.presence = presence;
+                    self.schedule_presence_markers(window, cx);
+                    cx.notify();
+                }
+            }
+            NativeSyncEvent::DocumentChanged { path, text, .. } => {
+                self.last_submitted_documents
+                    .insert(path.clone(), text.clone());
+                self.reload_open_document_from_remote(&path, &text, cx);
+            }
+            NativeSyncEvent::PdfChanged { .. } => {
+                if let Some(root) = self.paper_root.clone() {
+                    self.refresh_pdf(root, false, window, cx);
+                }
+            }
+            NativeSyncEvent::Error { message } => {
+                self.project_message = Some(message);
+                cx.notify();
+            }
+        }
+    }
+
     fn reset_cursor_publisher(&mut self) {
         self.cursor_task = Task::ready(());
         self.cursor_worker_running = false;
         self.pending_cursor = None;
         self.last_cursor_sent = None;
         self.last_cursor_sent_at = None;
+    }
+
+    fn reset_native_sync(&mut self) {
+        self.native_sync = None;
+        self.presence_task = Task::ready(());
+        self.document_push_task = Task::ready(());
+        self.pending_documents.clear();
+        self.last_submitted_documents.clear();
+        self.document_push_worker_running = false;
+    }
+
+    fn reload_open_document_from_remote(
+        &self,
+        document_path: &str,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.paper_root.as_ref() else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace.read(cx).project().clone();
+        for buffer in project.read(cx).opened_buffers(cx) {
+            if buffer_relative_path(&buffer, root, cx).as_deref() != Some(document_path)
+                || buffer.read(cx).text() == text
+            {
+                continue;
+            }
+            let reload = buffer.update(cx, |buffer, cx| buffer.reload_from_remote(cx));
+            cx.spawn(async move |_, _| {
+                let _ = reload.await;
+            })
+            .detach();
+        }
+    }
+
+    fn queue_project_document_updates(
+        &mut self,
+        project: &Entity<Project>,
+        source: BufferEditSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let origin = match source {
+            BufferEditSource::User => "editor",
+            BufferEditSource::Agent => "agent",
+            BufferEditSource::Remote => return,
+        };
+        let Some(root) = self.paper_root.as_ref() else {
+            return;
+        };
+        if self.native_sync.is_none() {
+            return;
+        }
+
+        for buffer in project.read(cx).opened_buffers(cx) {
+            let Some(path) = buffer_relative_path(&buffer, root, cx) else {
+                continue;
+            };
+            let text = buffer.read(cx).text();
+            if self.last_submitted_documents.get(&path) == Some(&text)
+                || self
+                    .pending_documents
+                    .get(&path)
+                    .is_some_and(|pending| pending.text == text)
+            {
+                continue;
+            }
+            self.pending_documents
+                .insert(path, PendingDocumentSnapshot { text, origin });
+        }
+
+        if self.pending_documents.is_empty() || self.document_push_worker_running {
+            return;
+        }
+        self.document_push_worker_running = true;
+        let tokio = Tokio::handle(cx);
+        self.document_push_task = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(90))
+                    .await;
+                let batch = this
+                    .update(cx, |this, _| {
+                        let Some(handle) = this.native_sync.clone() else {
+                            this.document_push_worker_running = false;
+                            return None;
+                        };
+                        if this.pending_documents.is_empty() {
+                            this.document_push_worker_running = false;
+                            return None;
+                        }
+                        Some((handle, std::mem::take(&mut this.pending_documents)))
+                    })
+                    .ok()
+                    .flatten();
+                let Some((handle, documents)) = batch else {
+                    return;
+                };
+
+                let result = tokio
+                    .spawn(async move {
+                        let mut submitted = Vec::with_capacity(documents.len());
+                        for (path, snapshot) in documents {
+                            handle
+                                .apply_snapshot(
+                                    path.clone(),
+                                    snapshot.text.clone(),
+                                    snapshot.origin,
+                                )
+                                .await?;
+                            submitted.push((path, snapshot.text));
+                        }
+                        Ok::<_, semantic_overleaf::sync::NativeSyncError>(submitted)
+                    })
+                    .await;
+
+                if this
+                    .update(cx, |this, cx| match result {
+                        Ok(Ok(submitted)) => {
+                            this.last_submitted_documents.extend(submitted);
+                        }
+                        Ok(Err(error)) => {
+                            this.project_message = Some(format!(
+                                "Could not send an editor change to Overleaf: {error}"
+                            ));
+                            cx.notify();
+                        }
+                        Err(error) => {
+                            this.project_message =
+                                Some(format!("The native Overleaf edit task stopped: {error}"));
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
     }
 
     fn schedule_presence_markers(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1504,11 +1779,6 @@ impl RemoteProject {
     }
 }
 
-#[derive(Deserialize)]
-struct RemoteProjectResponse {
-    projects: Vec<RemoteProject>,
-}
-
 #[derive(Clone, Debug)]
 enum ProjectListState {
     NotConnected,
@@ -1551,14 +1821,6 @@ impl ProjectListState {
 }
 
 impl PaperStatus {
-    fn from_result(result: Result<DaemonStatus>) -> Self {
-        match result {
-            Ok(status) => Self::Ready(status),
-            Err(error) if is_daemon_unavailable(&error) => Self::Unavailable,
-            Err(error) => Self::Error(error.to_string()),
-        }
-    }
-
     fn summary(&self) -> String {
         match self {
             Self::Unavailable => "Overleaf sync is not running.".to_string(),
@@ -1588,49 +1850,25 @@ struct DaemonStatus {
 }
 
 impl DaemonStatus {
-    fn from_value(value: Value) -> Result<Self> {
-        let state = value
-            .get("state")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("The sync daemon returned a status without a state."))?
-            .to_string();
-        let pending = value
-            .get("documents")
-            .and_then(|documents| documents.get("pending"))
-            .and_then(Value::as_u64)
-            .unwrap_or_default() as usize;
-        let conflicts = value
-            .get("conflicts")
-            .and_then(Value::as_array)
-            .map(|conflicts| {
-                conflicts
-                    .iter()
-                    .filter_map(|conflict| {
-                        conflict
-                            .get("path")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let project_name = value
-            .get("projectName")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        let last_compile_status = value
-            .get("lastCompile")
+    fn from_native(status: &NativeStatus) -> Self {
+        let last_compile_status = status
+            .last_compile
+            .as_ref()
             .and_then(|compile| compile.get("status"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
 
-        Ok(Self {
-            state,
-            project_name,
-            pending,
-            conflicts,
+        Self {
+            state: status.state.clone(),
+            project_name: status.project_name.clone(),
+            pending: status.documents.pending,
+            conflicts: status
+                .conflicts
+                .iter()
+                .map(|conflict| conflict.path.clone())
+                .collect(),
             last_compile_status,
-        })
+        }
     }
 
     fn summary(&self) -> String {
@@ -1686,6 +1924,18 @@ impl OverleafPresence {
     }
 }
 
+impl From<NativePresence> for OverleafPresence {
+    fn from(presence: NativePresence) -> Self {
+        Self {
+            client_id: presence.client_id,
+            name: presence.name,
+            document_path: presence.document_path,
+            row: presence.row,
+            column: presence.column,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LocalOverleafCursor {
     document_path: String,
@@ -1693,51 +1943,13 @@ struct LocalOverleafCursor {
     column: u32,
 }
 
-#[derive(Deserialize)]
-struct RuntimeDescriptor {
-    host: Option<String>,
-    port: u16,
-    token: String,
+#[derive(Clone, Debug)]
+struct PendingDocumentSnapshot {
+    text: String,
+    origin: &'static str,
 }
 
-#[derive(Serialize)]
-struct ControlRequest<'a> {
-    jsonrpc: &'static str,
-    id: &'static str,
-    method: &'a str,
-    params: Value,
-    token: &'a str,
-}
-
-#[derive(Deserialize)]
-struct ControlResponse {
-    id: Option<Value>,
-    result: Option<Value>,
-    error: Option<ControlError>,
-}
-
-#[derive(Deserialize)]
-struct ControlError {
-    message: String,
-}
-
-fn query_status(root: &Path) -> Result<DaemonStatus> {
-    let value = control_request(root, "status", json!({}))?;
-    DaemonStatus::from_value(value)
-}
-
-fn start_sync_and_query_status(root: &Path) -> Result<DaemonStatus> {
-    let status = overleaf_command()
-        .args(["start", "--workspace"])
-        .arg(root)
-        .status()
-        .context("starting semantic-zed-overleaf")?;
-    if !status.success() {
-        bail!("The local sync command exited unsuccessfully.");
-    }
-    query_status(root)
-}
-
+#[allow(clippy::disallowed_methods)]
 fn login_with_browser() -> Result<()> {
     let mut command = overleaf_command();
     command.args(["login", "--server", OVERLEAF_SERVER]);
@@ -1750,65 +1962,62 @@ fn login_with_browser() -> Result<()> {
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct AuthStatus {
-    connected: bool,
-}
-
 fn saved_login_exists() -> Result<bool> {
-    let output = overleaf_command()
-        .args(["auth-status", "--server", OVERLEAF_SERVER, "--json"])
-        .output()
-        .context("checking the saved Overleaf connection")?;
-    if !output.status.success() {
-        bail!("The Overleaf connection check did not complete.");
-    }
-    let status: AuthStatus = serde_json::from_slice(&output.stdout)
-        .context("parsing the saved Overleaf connection status")?;
-    Ok(status.connected)
+    Ok(CredentialStore::default().load(OVERLEAF_SERVER)?.is_some())
 }
 
-fn list_remote_projects() -> Result<Vec<RemoteProject>> {
-    let output = overleaf_command()
-        .args(["projects", "--server", OVERLEAF_SERVER, "--json"])
-        .output()
-        .context("listing Overleaf projects")?;
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        bail!(if error.is_empty() {
-            "The Overleaf project listing did not complete.".to_string()
-        } else {
-            error
-        });
-    }
-    let response: RemoteProjectResponse =
-        serde_json::from_slice(&output.stdout).context("parsing the Overleaf project list")?;
-    Ok(response.projects)
+async fn native_http_client() -> Result<OverleafHttpClient> {
+    let record = CredentialStore::default()
+        .load(OVERLEAF_SERVER)?
+        .ok_or_else(|| anyhow!("No saved Overleaf login exists."))?;
+    let mut client = OverleafHttpClient::new(OVERLEAF_SERVER)?;
+    client.set_identity(record.identity);
+    Ok(client)
 }
 
-fn create_remote_project(name: &str) -> Result<()> {
-    let output = overleaf_command()
-        .args([
-            "new-project",
-            "--name",
-            name,
-            "--template",
-            "none",
-            "--server",
-            OVERLEAF_SERVER,
-            "--json",
-        ])
-        .output()
-        .context("creating an Overleaf project")?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    bail!(if error.is_empty() {
-        "The Overleaf project could not be created.".to_string()
-    } else {
-        error
-    });
+async fn list_remote_projects() -> Result<Vec<RemoteProject>> {
+    let projects = native_http_client().await?.list_projects().await?;
+    projects
+        .into_iter()
+        .map(|mut value| {
+            let object = value
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("Overleaf returned a non-object project."))?;
+            if !object.contains_key("accessLevel")
+                && let Some(access) = object.get("source").cloned()
+            {
+                object.insert("accessLevel".into(), access);
+            }
+            let raw_status = object
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let archived = object
+                .get("archived")
+                .or_else(|| object.get("isArchived"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || raw_status == "archived";
+            let trashed = object
+                .get("trashed")
+                .or_else(|| object.get("isTrashed"))
+                .or_else(|| object.get("deleted"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || matches!(raw_status, "trashed" | "deleted");
+            object.insert("archived".into(), Value::Bool(archived));
+            object.insert("trashed".into(), Value::Bool(trashed));
+            serde_json::from_value(value).context("parsing an Overleaf project")
+        })
+        .collect()
+}
+
+async fn create_remote_project(name: &str) -> Result<()> {
+    native_http_client()
+        .await?
+        .create_project(name, "none")
+        .await?;
+    Ok(())
 }
 
 fn initialize_local_replica(project_id: &str, root: &Path) -> Result<()> {
@@ -1836,20 +2045,15 @@ fn initialize_local_replica(project_id: &str, root: &Path) -> Result<()> {
             "The selected folder is already linked to a different Overleaf project ({existing_id})."
         );
     }
-    let output = overleaf_command()
-        .args(["init", "--project-id", project_id, "--workspace"])
-        .arg(root)
-        .output()
-        .context("creating the local Overleaf replica")?;
-    if output.status.success() {
-        return Ok(());
+    let has_unrelated_entries = fs::read_dir(root)
+        .with_context(|| format!("reading {}", root.display()))?
+        .filter_map(|entry| entry.ok())
+        .any(|entry| entry.file_name() != ".DS_Store");
+    if has_unrelated_entries {
+        bail!("Target directory is not empty.");
     }
-    let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    bail!(if error.is_empty() {
-        "The local Overleaf replica could not be initialized.".to_string()
-    } else {
-        error
-    });
+    NativeProjectConfig::new(project_id)?.save(root)?;
+    Ok(())
 }
 
 /// Resolve the runtime shipped inside the app bundle before falling back to a
@@ -1899,187 +2103,6 @@ fn local_replica_error_message(error: &anyhow::Error) -> String {
         .to_string()
 }
 
-fn compile_and_query_status(root: &Path) -> Result<DaemonStatus> {
-    control_request(root, "compile", json!({}))?;
-    query_status(root)
-}
-
-fn publish_cursor(root: &Path, cursor: &LocalOverleafCursor) -> Result<()> {
-    control_request(
-        root,
-        "presence/update",
-        json!({
-            "path": cursor.document_path,
-            "row": cursor.row,
-            "column": cursor.column,
-        }),
-    )?;
-    Ok(())
-}
-
-fn control_request(root: &Path, method: &str, params: Value) -> Result<Value> {
-    let runtime_path = root.join(RUNTIME_METADATA_PATH);
-    let runtime = read_runtime(&runtime_path)?;
-    let address = control_address(&runtime)?;
-    let mut stream = TcpStream::connect_timeout(&address, CONTROL_TIMEOUT)
-        .with_context(|| format!("connecting to the local sync daemon for {method}"))?;
-    stream
-        .set_read_timeout(Some(CONTROL_TIMEOUT))
-        .context("setting local sync read timeout")?;
-    stream
-        .set_write_timeout(Some(CONTROL_TIMEOUT))
-        .context("setting local sync write timeout")?;
-
-    let request = ControlRequest {
-        jsonrpc: "2.0",
-        id: "semantic-zed",
-        method,
-        params,
-        token: &runtime.token,
-    };
-    serde_json::to_writer(&mut stream, &request).context("serializing local sync request")?;
-    stream
-        .write_all(b"\n")
-        .context("sending local sync request")?;
-    stream.flush().context("flushing local sync request")?;
-
-    let mut reader = BufReader::new(stream);
-    loop {
-        let mut line = String::new();
-        if reader
-            .read_line(&mut line)
-            .context("reading local sync response")?
-            == 0
-        {
-            bail!("The sync daemon closed the connection before responding to {method}.");
-        }
-        let response: ControlResponse =
-            serde_json::from_str(&line).context("parsing local sync response")?;
-        if response.id.as_ref() != Some(&Value::String("semantic-zed".to_string())) {
-            // Presence and document notifications share the authenticated
-            // control stream. They may arrive before a compile/status RPC
-            // response and must not be mistaken for an empty response.
-            continue;
-        }
-        if let Some(error) = response.error {
-            bail!("The sync daemon rejected {method}: {}", error.message);
-        }
-        return response
-            .result
-            .ok_or_else(|| anyhow!("The sync daemon returned no result for {method}."));
-    }
-}
-
-fn stream_presence(
-    root: &Path,
-    sender: async_channel::Sender<Vec<OverleafPresence>>,
-) -> Result<()> {
-    let mut announced_unavailable = false;
-    while !sender.is_closed() {
-        match stream_presence_session(root, &sender) {
-            Ok(()) => return Ok(()),
-            Err(_) if sender.is_closed() => return Ok(()),
-            Err(_) => {
-                if !announced_unavailable {
-                    if sender.send_blocking(Vec::new()).is_err() {
-                        return Ok(());
-                    }
-                    announced_unavailable = true;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn stream_presence_session(
-    root: &Path,
-    sender: &async_channel::Sender<Vec<OverleafPresence>>,
-) -> Result<()> {
-    let runtime = read_runtime(&root.join(RUNTIME_METADATA_PATH))?;
-    let address = control_address(&runtime)?;
-    let mut stream = TcpStream::connect_timeout(&address, CONTROL_TIMEOUT)
-        .context("connecting to the local Overleaf presence stream")?;
-    stream
-        .set_read_timeout(Some(PRESENCE_READ_TIMEOUT))
-        .context("setting Overleaf presence read timeout")?;
-    stream
-        .set_write_timeout(Some(CONTROL_TIMEOUT))
-        .context("setting Overleaf presence write timeout")?;
-    let request = ControlRequest {
-        jsonrpc: "2.0",
-        id: "semantic-zed-presence",
-        method: "subscribe",
-        params: json!({}),
-        token: &runtime.token,
-    };
-    serde_json::to_writer(&mut stream, &request)
-        .context("serializing Overleaf presence subscription")?;
-    stream
-        .write_all(b"\n")
-        .context("sending Overleaf presence subscription")?;
-    stream
-        .flush()
-        .context("flushing Overleaf presence subscription")?;
-
-    let mut reader = BufReader::new(stream);
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => bail!("The local Overleaf presence stream closed."),
-            Ok(_) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                continue;
-            }
-            Err(error) => return Err(error).context("reading Overleaf presence stream"),
-        }
-        let message: Value = serde_json::from_str(&line)
-            .context("parsing a local Overleaf presence notification")?;
-        if let Some(presence) = presence_from_control_message(&message)?
-            && sender.send_blocking(presence).is_err()
-        {
-            return Ok(());
-        }
-    }
-}
-
-fn presence_from_control_message(message: &Value) -> Result<Option<Vec<OverleafPresence>>> {
-    let cursors = if message.get("id").and_then(Value::as_str) == Some("semantic-zed-presence") {
-        if let Some(error) = message
-            .get("error")
-            .and_then(|error| error.get("message"))
-            .and_then(Value::as_str)
-        {
-            bail!("The sync daemon rejected the presence subscription: {error}");
-        }
-        message
-            .get("result")
-            .and_then(|result| result.get("presence"))
-            .cloned()
-            .unwrap_or_else(|| json!([]))
-    } else if message.get("method").and_then(Value::as_str) == Some("collaborator/changed") {
-        let params = message.get("params").cloned().unwrap_or_else(|| json!([]));
-        params.get("cursors").cloned().unwrap_or(params)
-    } else {
-        return Ok(None);
-    };
-
-    let presence: Vec<OverleafPresence> = serde_json::from_value(cursors)
-        .context("parsing privacy-minimized Overleaf cursor data")?;
-    Ok(Some(
-        presence
-            .into_iter()
-            .filter(OverleafPresence::is_valid)
-            .collect(),
-    ))
-}
-
 fn apply_presence_markers(
     workspace: &mut Workspace,
     root: &Path,
@@ -2109,7 +2132,7 @@ fn apply_presence_markers(
                     let anchor = snapshot.anchor_after(point);
                     let participant_index = presence_participant_index(&cursor.client_id);
                     NavigationTargetOverlay {
-                        target_range: anchor.clone()..anchor,
+                        target_range: anchor..anchor,
                         label: NavigationOverlayLabel {
                             // Keep names out of the text canvas. The matching
                             // color and identity live in the Collaborators card.
@@ -2133,16 +2156,36 @@ fn apply_presence_markers(
 }
 
 fn editor_relative_path(editor: &Entity<Editor>, root: &Path, cx: &App) -> Option<String> {
-    let absolute_path = editor.read(cx).active_buffer(cx).and_then(|buffer| {
-        let buffer = buffer.read(cx);
-        let file = buffer.file()?.as_local()?;
-        Some(file.abs_path(cx).to_path_buf())
+    let buffer = editor.read(cx).active_buffer(cx)?;
+    buffer_relative_path(&buffer, root, cx)
+}
+
+fn buffer_relative_path(buffer: &Entity<Buffer>, root: &Path, cx: &App) -> Option<String> {
+    let absolute_path = buffer.read(cx).file().and_then(|file| {
+        let local = file.as_local()?;
+        Some(local.abs_path(cx))
     })?;
     absolute_path
         .strip_prefix(root)
         .ok()
         .map(|path| path.to_string_lossy().replace('\\', "/"))
         .filter(|path| !path.is_empty())
+}
+
+fn open_document_snapshots(
+    project: &Entity<Project>,
+    root: &Path,
+    cx: &App,
+) -> Vec<(String, String)> {
+    project
+        .read(cx)
+        .opened_buffers(cx)
+        .into_iter()
+        .filter_map(|buffer| {
+            let path = buffer_relative_path(&buffer, root, cx)?;
+            Some((path, buffer.read(cx).text()))
+        })
+        .collect()
 }
 
 fn local_cursor_for_editor(
@@ -2168,41 +2211,9 @@ fn presence_participant_index(client_id: &str) -> u32 {
     })
 }
 
-fn read_runtime(runtime_path: &Path) -> Result<RuntimeDescriptor> {
-    let contents = fs::read_to_string(runtime_path)
-        .with_context(|| format!("reading {}", runtime_path.display()))?;
-    serde_json::from_str(&contents).context("parsing the local sync runtime metadata")
-}
-
-fn control_address(runtime: &RuntimeDescriptor) -> Result<SocketAddr> {
-    let host = runtime.host.as_deref().unwrap_or("127.0.0.1");
-    if host != "127.0.0.1" && host != "localhost" && host != "::1" {
-        bail!("The paper sync daemon is not using a loopback control address.");
-    }
-    format!("{host}:{}", runtime.port)
-        .parse()
-        .context("parsing local sync control address")
-}
-
-fn is_daemon_unavailable(error: &anyhow::Error) -> bool {
-    error.chain().any(|source| {
-        source
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|error| {
-                matches!(
-                    error.kind(),
-                    std::io::ErrorKind::ConnectionRefused
-                        | std::io::ErrorKind::NotFound
-                        | std::io::ErrorKind::TimedOut
-                )
-            })
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{net::TcpListener, thread};
     use tempfile::TempDir;
 
     #[test]
@@ -2289,133 +2300,26 @@ mod tests {
     }
 
     #[test]
-    fn authenticates_control_requests_without_exposing_the_runtime_token() {
-        let temporary = TempDir::new().expect("create temporary paper root");
-        let metadata = temporary.path().join(".semantic-zed");
-        fs::create_dir_all(&metadata).expect("create runtime metadata directory");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
-        let port = listener.local_addr().expect("read listener address").port();
-        fs::write(
-            metadata.join("runtime.json"),
-            format!(r#"{{"host":"127.0.0.1","port":{port},"token":"test-token"}}"#),
-        )
-        .expect("write runtime metadata");
-
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept control connection");
-            let mut request = String::new();
-            BufReader::new(stream.try_clone().expect("clone control stream"))
-                .read_line(&mut request)
-                .expect("read control request");
-            let request: Value = serde_json::from_str(&request).expect("parse control request");
-            assert_eq!(request["token"], "test-token");
-            assert_eq!(request["method"], "status");
-            writeln!(
-                stream,
-                r#"{{"jsonrpc":"2.0","id":"semantic-zed","result":{{"state":"live","documents":{{"pending":0}},"conflicts":[]}}}}"#
-            )
-            .expect("write control response");
+    fn validates_native_presence_before_rendering_it() {
+        let valid = OverleafPresence::from(NativePresence {
+            client_id: "remote-1".into(),
+            name: "Remote Writer".into(),
+            document_path: "sections/results.tex".into(),
+            row: 8,
+            column: 3,
         });
+        assert!(valid.is_valid());
 
-        let status = query_status(temporary.path()).expect("query daemon status");
-        assert_eq!(status.summary(), "Overleaf live · 0 pending");
-        server.join().expect("join control server");
-    }
-
-    #[test]
-    fn ignores_notifications_before_the_matching_control_response() {
-        let temporary = TempDir::new().expect("create temporary paper root");
-        let metadata = temporary.path().join(".semantic-zed");
-        fs::create_dir_all(&metadata).expect("create runtime metadata directory");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
-        let port = listener.local_addr().expect("read listener address").port();
-        fs::write(
-            metadata.join("runtime.json"),
-            format!(r#"{{"host":"127.0.0.1","port":{port},"token":"test-token"}}"#),
-        )
-        .expect("write runtime metadata");
-
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept control connection");
-            let mut request = String::new();
-            BufReader::new(stream.try_clone().expect("clone control stream"))
-                .read_line(&mut request)
-                .expect("read control request");
-            writeln!(
-                stream,
-                r#"{{"jsonrpc":"2.0","method":"collaborator/changed","params":{{"cursors":[]}}}}"#
-            )
-            .expect("write interleaved notification");
-            writeln!(
-                stream,
-                r#"{{"jsonrpc":"2.0","id":"semantic-zed","result":{{"state":"live","documents":{{"pending":0}},"conflicts":[]}}}}"#
-            )
-            .expect("write control response");
+        let escaping = OverleafPresence::from(NativePresence {
+            document_path: "../private.tex".into(),
+            ..NativePresence {
+                client_id: "remote-2".into(),
+                name: "Remote Writer".into(),
+                document_path: String::new(),
+                row: 0,
+                column: 0,
+            }
         });
-
-        let status = query_status(temporary.path()).expect("query daemon status");
-        assert_eq!(status.summary(), "Overleaf live · 0 pending");
-        server.join().expect("join control server");
-    }
-
-    #[test]
-    fn parses_initial_and_incremental_overleaf_presence() {
-        let initial = presence_from_control_message(&json!({
-            "jsonrpc": "2.0",
-            "id": "semantic-zed-presence",
-            "result": {
-                "subscribed": true,
-                "presence": [{
-                    "clientId": "remote-1",
-                    "name": "Remote Writer",
-                    "documentPath": "main.tex",
-                    "row": 2,
-                    "column": 7
-                }]
-            }
-        }))
-        .expect("parse initial presence")
-        .expect("initial presence message");
-        assert_eq!(initial.len(), 1);
-        assert_eq!(initial[0].document_path, "main.tex");
-        assert_eq!(initial[0].row, 2);
-
-        let updated = presence_from_control_message(&json!({
-            "jsonrpc": "2.0",
-            "method": "collaborator/changed",
-            "params": {
-                "cursors": [{
-                    "clientId": "remote-1",
-                    "name": "Remote Writer",
-                    "documentPath": "sections/results.tex",
-                    "row": 8,
-                    "column": 3
-                }]
-            }
-        }))
-        .expect("parse updated presence")
-        .expect("updated presence message");
-        assert_eq!(updated[0].document_path, "sections/results.tex");
-        assert_eq!(updated[0].column, 3);
-    }
-
-    #[test]
-    fn rejects_presence_paths_that_escape_the_replica() {
-        let presence = presence_from_control_message(&json!({
-            "jsonrpc": "2.0",
-            "method": "collaborator/changed",
-            "params": {
-                "cursors": [{
-                    "clientId": "remote-1",
-                    "name": "Remote Writer",
-                    "documentPath": "../private.tex",
-                    "row": 0,
-                    "column": 0
-                }]
-            }
-        }))
-        .expect("parse presence")
-        .expect("presence notification");
-        assert!(presence.is_empty());
+        assert!(!escaping.is_valid());
     }
 }
