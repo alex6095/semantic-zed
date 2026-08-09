@@ -186,7 +186,7 @@ impl Render for PdfPreviewPanel {
                         h_flex()
                             .gap_2()
                             .child(
-                                div()
+                                h_flex()
                                     .w_6()
                                     .h_6()
                                     .items_center()
