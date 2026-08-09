@@ -182,6 +182,7 @@ reqwest_client.workspace = true
 rope.workspace = true
 sandbox.workspace = true
 search.workspace = true
+semantic_zed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 session.workspace = true
@@ -280,13 +281,13 @@ repl = { workspace = true, features = ["test-support"] }
 
 
 
-[package.metadata.bundle-dev]
+[package.metadata.bundle]
 icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
-identifier = "dev.zed.Zed-Dev"
-name = "Zed Dev"
+identifier = "dev.semantic-zed.SemanticZed"
+name = "Semantic Zed"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["semantic-zed"]
 
 [package.metadata.bundle-nightly]
 icon = ["resources/app-icon-nightly@2x.png", "resources/app-icon-nightly.png"]
