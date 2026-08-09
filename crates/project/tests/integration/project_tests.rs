@@ -7026,7 +7026,7 @@ async fn test_dirty_buffer_reloads_after_undo(cx: &mut gpui::TestAppContext) {
     .unwrap();
     project
         .update(cx, |project, cx| {
-            project.reload_buffers(HashSet::from([buffer.clone()]), false, cx)
+            project.reload_buffers(std::iter::once(buffer.clone()).collect(), false, cx)
         })
         .await
         .unwrap();
