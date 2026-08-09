@@ -7,9 +7,11 @@
 
 pub mod credentials;
 pub mod http;
+pub mod merge;
 pub mod ot;
 pub mod project_model;
 pub mod realtime;
 pub mod replica;
+pub mod scan;
 pub mod socket_client;
 pub mod socket_io;
