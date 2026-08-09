@@ -144,6 +144,7 @@ pub struct PaperPanel {
     last_cursor_sent: Option<LocalOverleafCursor>,
     last_cursor_sent_at: Option<Instant>,
     native_sync: Option<NativeSyncHandle>,
+    native_sync_starting_root: Option<PathBuf>,
     pending_documents: HashMap<String, PendingDocumentSnapshot>,
     last_submitted_documents: HashMap<String, String>,
     document_push_worker_running: bool,
@@ -201,6 +202,7 @@ impl PaperPanel {
             last_cursor_sent: None,
             last_cursor_sent_at: None,
             native_sync: None,
+            native_sync_starting_root: None,
             pending_documents: HashMap::default(),
             last_submitted_documents: HashMap::default(),
             document_push_worker_running: false,
@@ -480,23 +482,37 @@ impl PaperPanel {
             return;
         }
 
+        if self.native_sync_starting_root.as_ref() == Some(&root) {
+            return;
+        }
+        self.native_sync_starting_root = Some(root.clone());
+
+        let root_for_start = root.clone();
         let start_task = Tokio::spawn_result(cx, async move {
-            let handle = NativeSyncHandle::start_from_root(root).await?;
+            let handle = NativeSyncHandle::start_from_root(root_for_start).await?;
             let status = handle.status().await?;
             Ok((handle, status))
         });
         self.task = cx.spawn_in(window, async move |this, cx| {
             let result = start_task.await;
-            this.update_in(cx, |this, window, cx| match result {
-                Ok((handle, status)) => {
-                    this.native_sync = Some(handle);
-                    this.apply_native_status(status, window, cx);
-                    this.restart_native_event_stream(window, cx);
+            this.update_in(cx, |this, window, cx| {
+                if this.native_sync_starting_root.as_ref() != Some(&root)
+                    || this.paper_root.as_ref() != Some(&root)
+                {
+                    return;
                 }
-                Err(error) => {
-                    this.status = PaperStatus::Error(error.to_string());
-                    this.clear_presence(window, cx);
-                    cx.notify();
+                this.native_sync_starting_root = None;
+                match result {
+                    Ok((handle, status)) => {
+                        this.native_sync = Some(handle);
+                        this.apply_native_status(status, window, cx);
+                        this.restart_native_event_stream(window, cx);
+                    }
+                    Err(error) => {
+                        this.status = PaperStatus::Error(error.to_string());
+                        this.clear_presence(window, cx);
+                        cx.notify();
+                    }
                 }
             })
             .log_err();
@@ -994,6 +1010,7 @@ impl PaperPanel {
 
     fn reset_native_sync(&mut self) {
         self.native_sync = None;
+        self.native_sync_starting_root = None;
         self.presence_task = Task::ready(());
         self.document_push_task = Task::ready(());
         self.pending_documents.clear();
