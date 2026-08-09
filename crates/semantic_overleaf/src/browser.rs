@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use async_tungstenite::tokio::connect_async;
 use async_tungstenite::tungstenite::Message;
-use futures::{SinkExt as _, StreamExt as _};
+use futures::StreamExt as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -193,9 +193,11 @@ async fn wait_for_page_target(
         browser.ensure_running()?;
         match client.get(&endpoint).send().await {
             Ok(response) if response.status().is_success() => {
-                let targets = response
-                    .json::<Vec<DevToolsTarget>>()
+                let body = response
+                    .text()
                     .await
+                    .map_err(|error| BrowserLoginError::DevTools(error.to_string()))?;
+                let targets = serde_json::from_str::<Vec<DevToolsTarget>>(&body)
                     .map_err(|error| BrowserLoginError::DevTools(error.to_string()))?;
                 let mut pages = targets.into_iter().filter(|target| {
                     target.kind == "page" && !target.web_socket_debugger_url.is_empty()
