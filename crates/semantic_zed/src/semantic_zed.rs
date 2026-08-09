@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 use editor::{
-    Editor, EditorElement, EditorStyle, NavigationOverlayKey, NavigationOverlayLabel,
+    Editor, EditorElement, EditorEvent, EditorStyle, NavigationOverlayKey, NavigationOverlayLabel,
     NavigationTargetOverlay,
 };
 use gpui::{
@@ -19,7 +19,7 @@ use std::{
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use theme_settings::ThemeSettings;
 use ui::{
@@ -41,6 +41,8 @@ const PROJECT_METADATA_PATH: &str = ".semantic-zed/project.json";
 const RUNTIME_METADATA_PATH: &str = ".semantic-zed/runtime.json";
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const PRESENCE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const CURSOR_UPDATE_THROTTLE: Duration = Duration::from_millis(250);
+const SAVE_COMPILE_DEBOUNCE: Duration = Duration::from_millis(350);
 const OVERLEAF_SERVER: &str = "https://www.overleaf.com/";
 
 enum OverleafPresenceOverlay {}
@@ -117,6 +119,9 @@ pub struct PaperPanel {
     login_task: Task<()>,
     projects_task: Task<()>,
     presence_task: Task<()>,
+    compile_task: Task<()>,
+    save_compile_task: Task<()>,
+    cursor_task: Task<()>,
     workspace: WeakEntity<Workspace>,
     projects: ProjectListState,
     initializing_project: Option<String>,
@@ -125,6 +130,11 @@ pub struct PaperPanel {
     show_new_project_form: bool,
     creating_project: bool,
     presence: Vec<OverleafPresence>,
+    active_editor_subscription: Option<Subscription>,
+    cursor_worker_running: bool,
+    pending_cursor: Option<LocalOverleafCursor>,
+    last_cursor_sent: Option<LocalOverleafCursor>,
+    last_cursor_sent_at: Option<Instant>,
     subscriptions: Vec<Subscription>,
 }
 
@@ -161,6 +171,9 @@ impl PaperPanel {
             login_task: Task::ready(()),
             projects_task: Task::ready(()),
             presence_task: Task::ready(()),
+            compile_task: Task::ready(()),
+            save_compile_task: Task::ready(()),
+            cursor_task: Task::ready(()),
             workspace: workspace_handle,
             projects: ProjectListState::NotConnected,
             initializing_project: None,
@@ -169,6 +182,11 @@ impl PaperPanel {
             show_new_project_form: false,
             creating_project: false,
             presence: Vec::new(),
+            active_editor_subscription: None,
+            cursor_worker_running: false,
+            pending_cursor: None,
+            last_cursor_sent: None,
+            last_cursor_sent_at: None,
             subscriptions: Vec::new(),
         });
 
@@ -204,6 +222,9 @@ impl PaperPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if paper_root != self.paper_root {
+            self.reset_cursor_publisher();
+        }
         self.paper_root = paper_root;
         self.refresh_current_root(window, cx);
     }
@@ -217,6 +238,7 @@ impl PaperPanel {
         let paper_root = Self::paper_root_for_project(project, cx);
         if paper_root != self.paper_root {
             self.paper_root = paper_root;
+            self.reset_cursor_publisher();
             self.refresh_current_root(window, cx);
         }
     }
@@ -253,12 +275,153 @@ impl PaperPanel {
         self.subscriptions.push(cx.subscribe_in(
             workspace,
             window,
-            |this, _, event: &workspace::Event, window, cx| {
-                if matches!(event, workspace::Event::ActiveItemChanged) {
+            |this, workspace, event: &workspace::Event, window, cx| match event {
+                workspace::Event::ActiveItemChanged => {
                     this.schedule_presence_markers(window, cx);
+                    this.schedule_observe_active_editor(workspace, window, cx);
+                }
+                workspace::Event::UserSavedItem { item, .. } => {
+                    if let Some(editor) = item.upgrade().and_then(|item| item.act_as::<Editor>(cx))
+                        && this.editor_belongs_to_replica(&editor, cx)
+                    {
+                        this.schedule_compile_after_save(window, cx);
+                    }
+                }
+                _ => {}
+            },
+        ));
+        self.schedule_observe_active_editor(workspace, window, cx);
+    }
+
+    fn schedule_observe_active_editor(
+        &self,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = cx.entity().downgrade();
+        let workspace = workspace.clone();
+        window.defer(cx, move |window, cx| {
+            panel
+                .update(cx, |panel, cx| {
+                    panel.observe_active_editor(&workspace, window, cx);
+                })
+                .ok();
+        });
+    }
+
+    fn observe_active_editor(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_editor_subscription = None;
+        let Some(editor) = workspace.read(cx).active_item_as::<Editor>(cx) else {
+            return;
+        };
+        self.active_editor_subscription = Some(cx.subscribe_in(
+            &editor,
+            window,
+            |this, editor, event: &EditorEvent, window, cx| {
+                if matches!(event, EditorEvent::SelectionsChanged { local: true }) {
+                    this.queue_cursor_update(editor, window, cx);
                 }
             },
         ));
+        self.queue_cursor_update(&editor, window, cx);
+    }
+
+    fn editor_belongs_to_replica(&self, editor: &Entity<Editor>, cx: &App) -> bool {
+        self.paper_root
+            .as_ref()
+            .and_then(|root| editor_relative_path(editor, root, cx))
+            .is_some()
+    }
+
+    fn queue_active_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(editor) = workspace.read(cx).active_item_as::<Editor>(cx) else {
+            return;
+        };
+        self.queue_cursor_update(&editor, window, cx);
+    }
+
+    fn queue_cursor_update(
+        &mut self,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.status.is_live() {
+            return;
+        }
+        let Some(root) = self.paper_root.as_ref() else {
+            return;
+        };
+        let Some(cursor) = local_cursor_for_editor(editor, root, cx) else {
+            return;
+        };
+        if self.last_cursor_sent.as_ref() == Some(&cursor)
+            || self.pending_cursor.as_ref() == Some(&cursor)
+        {
+            return;
+        }
+        self.pending_cursor = Some(cursor);
+        if self.cursor_worker_running {
+            return;
+        }
+
+        self.cursor_worker_running = true;
+        let root = root.clone();
+        self.cursor_task = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                let delay = this
+                    .update(cx, |this, _| {
+                        if this.pending_cursor.is_none() {
+                            this.cursor_worker_running = false;
+                            return None;
+                        }
+                        let elapsed = this
+                            .last_cursor_sent_at
+                            .map(|sent_at| sent_at.elapsed())
+                            .unwrap_or(CURSOR_UPDATE_THROTTLE);
+                        Some(CURSOR_UPDATE_THROTTLE.saturating_sub(elapsed))
+                    })
+                    .ok()
+                    .flatten();
+                let Some(delay) = delay else {
+                    return;
+                };
+                if !delay.is_zero() {
+                    cx.background_executor().timer(delay).await;
+                }
+
+                let cursor = this
+                    .update(cx, |this, _| this.pending_cursor.take())
+                    .ok()
+                    .flatten();
+                let Some(cursor) = cursor else {
+                    continue;
+                };
+                let cursor_for_request = cursor.clone();
+                let request_root = root.clone();
+                let result = cx
+                    .background_spawn(
+                        async move { publish_cursor(&request_root, &cursor_for_request) },
+                    )
+                    .await;
+                this.update(cx, |this, _| {
+                    this.last_cursor_sent_at = Some(Instant::now());
+                    if result.is_ok() {
+                        this.last_cursor_sent = Some(cursor);
+                    }
+                })
+                .ok();
+            }
+        });
     }
 
     fn refresh_current_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -279,6 +442,7 @@ impl PaperPanel {
                 this.status = PaperStatus::from_result(status);
                 if should_stream {
                     this.restart_presence_stream(window, cx);
+                    this.queue_active_cursor(window, cx);
                 } else {
                     this.clear_presence(window, cx);
                 }
@@ -302,6 +466,7 @@ impl PaperPanel {
                 this.status = PaperStatus::from_result(status);
                 if should_stream {
                     this.restart_presence_stream(window, cx);
+                    this.queue_active_cursor(window, cx);
                 } else {
                     this.clear_presence(window, cx);
                 }
@@ -563,19 +728,41 @@ impl PaperPanel {
     }
 
     fn compile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_compile(true, window, cx);
+    }
+
+    fn schedule_compile_after_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.status.is_live() {
+            return;
+        }
+        self.save_compile_task = cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(SAVE_COMPILE_DEBOUNCE).await;
+            this.update_in(cx, |this, window, cx| {
+                this.start_compile(false, window, cx);
+            })
+            .ok();
+        });
+    }
+
+    fn start_compile(&mut self, reveal_pdf: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.paper_root.clone() else {
             return;
         };
+        if !self.status.is_live() {
+            return;
+        }
         self.status = PaperStatus::Compiling;
         cx.notify();
-        let compile_task = cx.background_spawn(async move { compile_and_query_status(&root) });
-        self.task = cx.spawn_in(window, async move |this, cx| {
+        let compile_root = root.clone();
+        let compile_task =
+            cx.background_spawn(async move { compile_and_query_status(&compile_root) });
+        self.compile_task = cx.spawn_in(window, async move |this, cx| {
             let status = compile_task.await;
             this.update_in(cx, |this, window, cx| {
                 let compiled = status.is_ok();
                 this.status = PaperStatus::from_result(status);
                 if compiled {
-                    this.preview_pdf(window, cx);
+                    this.refresh_pdf(root, reveal_pdf, window, cx);
                 }
                 cx.notify();
             })
@@ -587,6 +774,16 @@ impl PaperPanel {
         let Some(root) = self.paper_root.clone() else {
             return;
         };
+        self.refresh_pdf(root, true, window, cx);
+    }
+
+    fn refresh_pdf(
+        &mut self,
+        root: PathBuf,
+        reveal: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let workspace = self.workspace.clone();
         // Revealing a dock panel asks the workspace to inspect all panel
         // handles, including this PaperPanel. Run after the current button
@@ -596,7 +793,9 @@ impl PaperPanel {
                 return;
             };
             workspace.update(cx, |workspace, cx| {
-                workspace.reveal_panel::<PdfPreviewPanel>(window, cx);
+                if reveal {
+                    workspace.reveal_panel::<PdfPreviewPanel>(window, cx);
+                }
                 if let Some(panel) = workspace.panel::<PdfPreviewPanel>(cx) {
                     panel.update(cx, |panel, cx| panel.open_for_root(root, window, cx));
                 }
@@ -606,6 +805,7 @@ impl PaperPanel {
 
     fn clear_presence(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.presence_task = Task::ready(());
+        self.reset_cursor_publisher();
         if !self.presence.is_empty() {
             self.presence.clear();
             self.schedule_presence_markers(window, cx);
@@ -617,6 +817,9 @@ impl PaperPanel {
             self.clear_presence(window, cx);
             return;
         };
+        // A new Overleaf socket session has no cursor state, even if the local
+        // caret has not moved. Publish it again after every reconnect.
+        self.reset_cursor_publisher();
         let (sender, receiver) = async_channel::bounded(32);
         let stream_root = root.clone();
         let stream_task = cx.background_spawn(async move { stream_presence(&stream_root, sender) });
@@ -638,6 +841,14 @@ impl PaperPanel {
             }
             stream_task.await.log_err();
         });
+    }
+
+    fn reset_cursor_publisher(&mut self) {
+        self.cursor_task = Task::ready(());
+        self.cursor_worker_running = false;
+        self.pending_cursor = None;
+        self.last_cursor_sent = None;
+        self.last_cursor_sent_at = None;
     }
 
     fn schedule_presence_markers(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -758,6 +969,49 @@ impl Render for PaperPanel {
         let connected = matches!(&self.login, LoginState::Connected);
         let project_count = self.projects.projects().len();
         let presence_count = self.presence.len();
+        let mut collaborator_rows = v_flex().gap_1();
+        for collaborator in &self.presence {
+            let participant_index = presence_participant_index(&collaborator.client_id);
+            let participant_color = cx
+                .theme()
+                .players()
+                .color_for_participant(participant_index)
+                .cursor;
+            collaborator_rows = collaborator_rows.child(
+                h_flex()
+                    .gap_2()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(10.0))
+                            .h(px(10.0))
+                            .rounded_full()
+                            .bg(participant_color),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(
+                                Label::new(collaborator.display_name())
+                                    .size(LabelSize::XSmall)
+                                    .weight(FontWeight::MEDIUM)
+                                    .truncate(),
+                            )
+                            .child(
+                                Label::new(format!(
+                                    "{} · {}:{}",
+                                    collaborator.document_path,
+                                    collaborator.row + 1,
+                                    collaborator.column + 1
+                                ))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .truncate(),
+                            ),
+                    ),
+            );
+        }
         let mut project_rows = v_flex().id("semantic-zed-project-list").gap_1();
         if let Some(detail) = self.projects.detail() {
             project_rows = project_rows.child(
@@ -1003,12 +1257,26 @@ impl Render for PaperPanel {
                     )
                     .when(presence_count > 0, |this| {
                         this.child(
-                            Label::new(format!(
-                                "{presence_count} Overleaf collaborator{} in the editor",
-                                if presence_count == 1 { "" } else { "s" }
-                            ))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Accent),
+                            v_flex()
+                                .gap_1()
+                                .pt_1()
+                                .border_t_1()
+                                .border_color(cx.theme().colors().border_variant)
+                                .child(
+                                    h_flex()
+                                        .justify_between()
+                                        .child(
+                                            Label::new("Collaborators")
+                                                .size(LabelSize::XSmall)
+                                                .weight(FontWeight::SEMIBOLD),
+                                        )
+                                        .child(
+                                            Label::new(presence_count.to_string())
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Accent),
+                                        ),
+                                )
+                                .child(collaborator_rows),
                         )
                     })
                     .child(
@@ -1284,6 +1552,10 @@ impl PaperStatus {
     fn can_compile(&self) -> bool {
         matches!(self, Self::Ready(status) if status.can_compile())
     }
+
+    fn is_live(&self) -> bool {
+        matches!(self, Self::Ready(status) if status.is_live())
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1392,6 +1664,13 @@ impl OverleafPresence {
             name
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalOverleafCursor {
+    document_path: String,
+    row: u32,
+    column: u32,
 }
 
 #[derive(Deserialize)]
@@ -1605,6 +1884,19 @@ fn compile_and_query_status(root: &Path) -> Result<DaemonStatus> {
     query_status(root)
 }
 
+fn publish_cursor(root: &Path, cursor: &LocalOverleafCursor) -> Result<()> {
+    control_request(
+        root,
+        "presence/update",
+        json!({
+            "path": cursor.document_path,
+            "row": cursor.row,
+            "column": cursor.column,
+        }),
+    )?;
+    Ok(())
+}
+
 fn control_request(root: &Path, method: &str, params: Value) -> Result<Value> {
     let runtime_path = root.join(RUNTIME_METADATA_PATH);
     let runtime = read_runtime(&runtime_path)?;
@@ -1776,16 +2068,7 @@ fn apply_presence_markers(
 ) {
     let editors = workspace.items_of_type::<Editor>(cx).collect::<Vec<_>>();
     for editor in editors {
-        let absolute_path = editor.read(cx).active_buffer(cx).and_then(|buffer| {
-            let buffer = buffer.read(cx);
-            let file = buffer.file()?.as_local()?;
-            Some(file.abs_path(cx).to_path_buf())
-        });
-        let relative_path = absolute_path.and_then(|path| {
-            path.strip_prefix(root)
-                .ok()
-                .map(|path| path.to_string_lossy().replace('\\', "/"))
-        });
+        let relative_path = editor_relative_path(&editor, root, cx);
         let cursors = presence
             .iter()
             .filter(|cursor| relative_path.as_deref() == Some(cursor.document_path.as_str()))
@@ -1808,14 +2091,16 @@ fn apply_presence_markers(
                     NavigationTargetOverlay {
                         target_range: anchor.clone()..anchor,
                         label: NavigationOverlayLabel {
-                            text: format!("▌ {}", cursor.display_name()).into(),
+                            // Keep names out of the text canvas. The matching
+                            // color and identity live in the Collaborators card.
+                            text: "│".into(),
                             text_color: cx
                                 .theme()
                                 .players()
                                 .color_for_participant(participant_index)
                                 .cursor,
-                            x_offset: gpui::px(-1.0),
-                            scale_factor: 0.82,
+                            x_offset: gpui::px(-0.5),
+                            scale_factor: 1.0,
                         },
                         covered_text_range: None,
                     }
@@ -1824,6 +2109,36 @@ fn apply_presence_markers(
             editor.set_navigation_overlays(OVERLEAF_PRESENCE_OVERLAY_KEY, overlays, cx);
         });
     }
+}
+
+fn editor_relative_path(editor: &Entity<Editor>, root: &Path, cx: &App) -> Option<String> {
+    let absolute_path = editor.read(cx).active_buffer(cx).and_then(|buffer| {
+        let buffer = buffer.read(cx);
+        let file = buffer.file()?.as_local()?;
+        Some(file.abs_path(cx).to_path_buf())
+    })?;
+    absolute_path
+        .strip_prefix(root)
+        .ok()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .filter(|path| !path.is_empty())
+}
+
+fn local_cursor_for_editor(
+    editor: &Entity<Editor>,
+    root: &Path,
+    cx: &mut App,
+) -> Option<LocalOverleafCursor> {
+    let document_path = editor_relative_path(editor, root, cx)?;
+    let point = editor.update(cx, |editor, cx| {
+        let snapshot = editor.display_snapshot(cx);
+        editor.selections.newest::<Point>(&snapshot).head()
+    });
+    Some(LocalOverleafCursor {
+        document_path,
+        row: point.row,
+        column: point.column,
+    })
 }
 
 fn presence_participant_index(client_id: &str) -> u32 {

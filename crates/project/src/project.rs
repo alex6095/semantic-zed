@@ -1148,6 +1148,23 @@ impl DisableAiSettings {
     }
 }
 
+/// External writes in a Semantic Zed Overleaf replica are collaboration
+/// updates, not edits authored by this editor instance. Keep them visible in
+/// the buffer while excluding their reload transaction from the local
+/// undo/redo stack. Ordinary projects retain Zed's existing reload history.
+fn external_reload_pushes_to_history(buffer: &Entity<Buffer>, cx: &App) -> bool {
+    let Some(absolute_path) = buffer.read(cx).file().and_then(|file| {
+        let local = file.as_local()?;
+        Some(local.abs_path(cx))
+    }) else {
+        return true;
+    };
+
+    !absolute_path
+        .ancestors()
+        .any(|ancestor| ancestor.join(".semantic-zed/project.json").is_file())
+}
+
 impl Project {
     pub fn init(client: &Arc<Client>, cx: &mut App) {
         connection_manager::init(client.clone(), cx);
@@ -3977,8 +3994,13 @@ impl Project {
         match event {
             BufferEvent::ReloadNeeded => {
                 if !self.is_via_collab() {
-                    self.reload_buffers([buffer.clone()].into_iter().collect(), true, cx)
-                        .detach_and_log_err(cx);
+                    let push_to_history = external_reload_pushes_to_history(&buffer, cx);
+                    self.reload_buffers(
+                        [buffer.clone()].into_iter().collect(),
+                        push_to_history,
+                        cx,
+                    )
+                    .detach_and_log_err(cx);
                 }
             }
             BufferEvent::Operation {
