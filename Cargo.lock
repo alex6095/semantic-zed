@@ -16648,6 +16648,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b12e76d157a900eb52e81bc6e9f3069344290341720e9178cde2407113ac8d89"
 
 [[package]]
+name = "semantic_overleaf"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "similar",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "semantic_zed"
 version = "0.1.0"
 dependencies = [

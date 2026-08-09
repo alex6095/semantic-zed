@@ -182,6 +182,7 @@ members = [
     "crates/scheduler",
     "crates/schema_generator",
     "crates/search",
+    "crates/semantic_overleaf",
     "crates/semantic_zed",
     "crates/session",
     "crates/settings",
@@ -449,6 +450,7 @@ rpc = { path = "crates/rpc" }
 scheduler = { path = "crates/scheduler" }
 sandbox = { path = "crates/sandbox" }
 search = { path = "crates/search" }
+semantic_overleaf = { path = "crates/semantic_overleaf" }
 semantic_zed = { path = "crates/semantic_zed" }
 session = { path = "crates/session" }
 sidebar = { path = "crates/sidebar" }
