@@ -13,8 +13,17 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
+base64.workspace = true
+dirs.workspace = true
+percent-encoding.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 similar = "2.7.0"
 thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+url.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true

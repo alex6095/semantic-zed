@@ -5,5 +5,7 @@
 //! and history-OT handling in Rust so the editor does not require a Node.js
 //! process for its core collaboration path.
 
+pub mod credentials;
+pub mod http;
 pub mod ot;
 pub mod socket_io;
