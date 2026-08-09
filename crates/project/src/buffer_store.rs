@@ -760,7 +760,19 @@ impl LocalBufferStore {
         cx.spawn(async move |_, cx| {
             let mut project_transaction = ProjectTransaction::default();
             for buffer in buffers {
-                let transaction = buffer.update(cx, |buffer, cx| buffer.reload(cx)).await?;
+                // A caller that opts out of history is reloading bytes that did not originate
+                // from direct editor input (for example an agent's "discard" choice).  Do not
+                // briefly put that change in the user's undo stack and remove it afterwards:
+                // doing so misattributes the edit and can race with a subsequent Cmd-Z.
+                let transaction = buffer
+                    .update(cx, |buffer, cx| {
+                        if push_to_history {
+                            buffer.reload(cx)
+                        } else {
+                            buffer.reload_from_external(BufferEditSource::External, cx)
+                        }
+                    })
+                    .await?;
                 buffer.update(cx, |buffer, cx| {
                     if let Some(transaction) = transaction {
                         if !push_to_history {

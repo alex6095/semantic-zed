@@ -6933,6 +6933,18 @@ async fn test_dirty_buffer_reloads_after_undo(cx: &mut gpui::TestAppContext) {
         .update(cx, |p, cx| p.open_local_buffer(path!("/dir/file.txt"), cx))
         .await
         .unwrap();
+    let edit_sources = Arc::new(Mutex::new(Vec::new()));
+    buffer.update(cx, |_, cx| {
+        cx.subscribe(&buffer, {
+            let edit_sources = edit_sources.clone();
+            move |_, _, event, _| {
+                if let BufferEvent::Edited { source } = event {
+                    edit_sources.lock().push(*source);
+                }
+            }
+        })
+        .detach();
+    });
 
     buffer.read_with(cx, |buffer, _| {
         assert_eq!(buffer.text(), "version 1");
@@ -6943,6 +6955,7 @@ async fn test_dirty_buffer_reloads_after_undo(cx: &mut gpui::TestAppContext) {
     buffer.update(cx, |buffer, cx| {
         buffer.edit([(0..0, "user edit: ")], None, cx);
     });
+    edit_sources.lock().clear();
 
     buffer.read_with(cx, |buffer, _| {
         assert!(buffer.is_dirty());
@@ -6981,6 +6994,56 @@ async fn test_dirty_buffer_reloads_after_undo(cx: &mut gpui::TestAppContext) {
             "buffer should reload from disk after undo makes it clean"
         );
         assert!(!buffer.is_dirty());
+    });
+
+    // The disk change is generic External input, while the preceding Cmd-Z is a user action.
+    // More importantly, the external reload must not erase the user's redo entry: Cmd-Shift-Z
+    // (or Ctrl-Y) is still allowed to redo the one direct local edit over the new disk snapshot.
+    assert_eq!(
+        *edit_sources.lock(),
+        vec![
+            language::BufferEditSource::User,
+            language::BufferEditSource::External,
+        ]
+    );
+    buffer.update(cx, |buffer, cx| {
+        buffer.redo(cx);
+        assert_eq!(buffer.text(), "user edit: version 2 from external tool");
+        buffer.undo(cx);
+        assert_eq!(buffer.text(), "version 2 from external tool");
+    });
+
+    // `reload_buffers(..., false)` is also used by non-user workflows such as an agent discarding
+    // a dirty buffer. It must take the same External path instead of creating and then removing a
+    // User transaction after the fact.
+    edit_sources.lock().clear();
+    fs.save(
+        path!("/dir/file.txt").as_ref(),
+        &"version 3 from a generic local tool".into(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    project
+        .update(cx, |project, cx| {
+            project.reload_buffers(HashSet::from([buffer.clone()]), false, cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        *edit_sources.lock(),
+        vec![language::BufferEditSource::External]
+    );
+    buffer.update(cx, |buffer, cx| {
+        assert_eq!(buffer.text(), "version 3 from a generic local tool");
+        buffer.redo(cx);
+        assert_eq!(
+            buffer.text(),
+            "user edit: version 3 from a generic local tool"
+        );
+        buffer.undo(cx);
+        assert_eq!(buffer.text(), "version 3 from a generic local tool");
+        assert!(buffer.undo(cx).is_none());
     });
 }
 

@@ -526,9 +526,9 @@ fn test_edit_events(cx: &mut gpui::App) {
 fn test_external_edit_sources_do_not_enter_user_undo(cx: &mut gpui::App) {
     let buffer = cx.new(|cx| Buffer::local("abc", cx));
     buffer.update(cx, |buffer, cx| {
-        let user_transaction = buffer.start_transaction().unwrap();
+        let first_user_transaction = buffer.start_transaction().unwrap();
         buffer.edit([(0..0, "U")], None, cx);
-        assert_eq!(buffer.end_transaction(cx), Some(user_transaction));
+        assert_eq!(buffer.end_transaction(cx), Some(first_user_transaction));
 
         buffer.start_transaction();
         buffer.edit([(buffer.len()..buffer.len(), "A")], None, cx);
@@ -548,25 +548,42 @@ fn test_external_edit_sources_do_not_enter_user_undo(cx: &mut gpui::App) {
             .end_transaction_with_source(BufferEditSource::External, cx)
             .unwrap();
 
-        assert_eq!(buffer.text(), "UabcARE");
+        // A later direct edit must start a second user transaction, even when it occurs within
+        // the regular undo grouping window. The detached changes between the two user edits are
+        // a hard history boundary.
+        let second_user_transaction = buffer.start_transaction().unwrap();
+        buffer.edit([(buffer.len()..buffer.len(), "L")], None, cx);
+        assert_eq!(buffer.end_transaction(cx), Some(second_user_transaction));
+
+        assert_eq!(buffer.text(), "UabcAREL");
         assert_eq!(
             buffer.peek_undo_stack().map(|entry| entry.transaction_id()),
-            Some(user_transaction)
+            Some(second_user_transaction)
         );
         assert!(buffer.get_transaction(agent_transaction).is_some());
         assert!(buffer.get_transaction(remote_transaction).is_none());
         assert!(buffer.get_transaction(external_transaction).is_none());
 
         buffer.undo(cx);
+        assert_eq!(buffer.text(), "UabcARE");
+        assert_eq!(
+            buffer.peek_undo_stack().map(|entry| entry.transaction_id()),
+            Some(first_user_transaction)
+        );
+        buffer.undo(cx);
         assert_eq!(buffer.text(), "abcARE");
+        assert!(buffer.undo(cx).is_none());
+
         buffer.redo(cx);
         assert_eq!(buffer.text(), "UabcARE");
+        buffer.redo(cx);
+        assert_eq!(buffer.text(), "UabcAREL");
 
         assert!(buffer.undo_transaction(agent_transaction, cx));
-        assert_eq!(buffer.text(), "UabcRE");
+        assert_eq!(buffer.text(), "UabcREL");
         assert!(!buffer.undo_transaction(remote_transaction, cx));
         assert!(!buffer.undo_transaction(external_transaction, cx));
-        assert_eq!(buffer.text(), "UabcRE");
+        assert_eq!(buffer.text(), "UabcREL");
     });
 }
 
