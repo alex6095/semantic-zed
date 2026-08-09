@@ -13,7 +13,7 @@ use language::{Bias, Buffer, BufferEditSource, Point};
 use project::{DirectoryLister, Project};
 use semantic_overleaf::{
     credentials::CredentialStore,
-    http::OverleafHttpClient,
+    http::{Identity, OverleafHttpClient},
     sync::{
         NativePresence, NativeProjectConfig, NativeStatus, NativeSyncError, NativeSyncEvent,
         NativeSyncHandle,
@@ -596,14 +596,20 @@ impl PaperPanel {
             cx.notify();
             return;
         }
+        if self.projects.is_loading() {
+            return;
+        }
 
-        self.projects = ProjectListState::Loading;
+        let previous = self.projects.projects().to_vec();
+        self.projects = ProjectListState::Loading {
+            previous: previous.clone(),
+        };
         cx.notify();
         let list_task = Tokio::spawn_result(cx, list_remote_projects());
         self.projects_task = cx.spawn_in(window, async move |this, cx| {
             let projects = list_task.await;
             this.update_in(cx, |this, _, cx| {
-                this.projects = ProjectListState::from_result(projects);
+                this.projects = ProjectListState::from_result(projects, previous);
                 cx.notify();
             })
             .log_err();
@@ -1168,6 +1174,8 @@ impl PaperPanel {
         };
 
         v_flex()
+            .w_full()
+            .min_w_0()
             .gap_2()
             .p_3()
             .bg(palette.card)
@@ -1176,17 +1184,19 @@ impl PaperPanel {
             .rounded_lg()
             .shadow(palette.card_shadow)
             .child(
-                Label::new("New blank project")
+                Label::new("New project")
                     .size(LabelSize::Small)
                     .weight(FontWeight::SEMIBOLD),
             )
             .child(
-                Label::new("Creates an Overleaf project; choose its local folder afterwards.")
+                Label::new("Create on Overleaf, then choose a local folder.")
                     .size(LabelSize::XSmall)
-                    .color(Color::Muted),
+                    .color(Color::Muted)
+                    .line_clamp(2),
             )
             .child(
                 h_flex()
+                    .w_full()
                     .h_8()
                     .min_w_0()
                     .px_2()
@@ -1197,6 +1207,8 @@ impl PaperPanel {
             )
             .child(
                 h_flex()
+                    .w_full()
+                    .min_w_0()
                     .justify_end()
                     .gap_1()
                     .child(
@@ -1213,7 +1225,7 @@ impl PaperPanel {
                             if self.creating_project {
                                 "Creating…"
                             } else {
-                                "Create project"
+                                "Create"
                             },
                         )
                         .style(ButtonStyle::Tinted(TintColor::Accent))
@@ -1399,6 +1411,8 @@ impl Render for PaperPanel {
             .bg(palette.sidebar)
             .child(
                 h_flex()
+                    .w_full()
+                    .min_w_0()
                     .justify_between()
                     .child(
                         h_flex()
@@ -1433,7 +1447,11 @@ impl Render for PaperPanel {
                             .child(
                                 Button::new("semantic-zed-project-refresh", "Refresh")
                                     .style(ButtonStyle::Transparent)
-                                    .disabled(!connected || self.creating_project)
+                                    .disabled(
+                                        !connected
+                                            || self.creating_project
+                                            || self.projects.is_loading(),
+                                    )
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.refresh_projects(window, cx);
                                     })),
@@ -1494,6 +1512,9 @@ impl Render for PaperPanel {
             )
             .child(
                 h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
                     .justify_between()
                     .child(
                         v_flex()
@@ -1509,15 +1530,18 @@ impl Render for PaperPanel {
                                     .color(Color::Muted),
                             ),
                     )
-                    .when(self.show_new_project_form, |this| {
-                        this.child(self.render_new_project_form(cx))
-                    })
                     .child(
-                        Label::new(self.projects.summary())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        div().flex_1().min_w_0().child(
+                            Label::new(self.projects.summary())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
                     ),
             )
+            .when(self.show_new_project_form, |this| {
+                this.child(self.render_new_project_form(cx))
+            })
             .child(
                 div()
                     .id("semantic-zed-project-scroll")
@@ -1783,32 +1807,44 @@ impl RemoteProject {
 #[derive(Clone, Debug)]
 enum ProjectListState {
     NotConnected,
-    Loading,
+    Loading {
+        previous: Vec<RemoteProject>,
+    },
     Ready(Vec<RemoteProject>),
-    Error(String),
+    Error {
+        previous: Vec<RemoteProject>,
+        message: String,
+    },
 }
 
 impl ProjectListState {
-    fn from_result(result: Result<Vec<RemoteProject>>) -> Self {
+    fn from_result(result: Result<Vec<RemoteProject>>, previous: Vec<RemoteProject>) -> Self {
         match result {
             Ok(projects) => Self::Ready(projects),
-            Err(error) => Self::Error(error.to_string()),
+            Err(error) => Self::Error {
+                previous,
+                message: local_replica_error_message(&error),
+            },
         }
     }
 
     fn summary(&self) -> &'static str {
         match self {
             Self::NotConnected => "Connect an Overleaf account to browse projects.",
-            Self::Loading => "Loading your Overleaf projects…",
+            Self::Loading { previous } if previous.is_empty() => "Loading your Overleaf projects…",
+            Self::Loading { .. } => "Refreshing Overleaf projects…",
             Self::Ready(projects) if projects.is_empty() => "No Overleaf projects found.",
             Self::Ready(_) => "Choose a project to create or open its local replica.",
-            Self::Error(_) => "Could not load Overleaf projects.",
+            Self::Error { previous, .. } if previous.is_empty() => {
+                "Could not load Overleaf projects."
+            }
+            Self::Error { .. } => "Showing the last update. Refresh failed.",
         }
     }
 
     fn detail(&self) -> Option<&str> {
         match self {
-            Self::Error(error) => Some(error),
+            Self::Error { message, .. } => Some(message),
             _ => None,
         }
     }
@@ -1816,8 +1852,13 @@ impl ProjectListState {
     fn projects(&self) -> &[RemoteProject] {
         match self {
             Self::Ready(projects) => projects,
-            _ => &[],
+            Self::Loading { previous } | Self::Error { previous, .. } => previous,
+            Self::NotConnected => &[],
         }
+    }
+
+    fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading { .. })
     }
 }
 
@@ -1967,17 +2008,30 @@ fn saved_login_exists() -> Result<bool> {
     Ok(CredentialStore::default().load(OVERLEAF_SERVER)?.is_some())
 }
 
-async fn native_http_client() -> Result<OverleafHttpClient> {
+async fn native_http_client() -> Result<(OverleafHttpClient, Identity)> {
     let record = CredentialStore::default()
         .load(OVERLEAF_SERVER)?
         .ok_or_else(|| anyhow!("No saved Overleaf login exists."))?;
+    let saved_identity = record.identity;
     let mut client = OverleafHttpClient::new(OVERLEAF_SERVER)?;
-    client.set_identity(record.identity);
-    Ok(client)
+    client.set_identity(saved_identity.clone());
+    Ok((client, saved_identity))
+}
+
+fn persist_rotated_identity(client: &OverleafHttpClient, saved_identity: &Identity) -> Result<()> {
+    let Some(current_identity) = client.identity() else {
+        return Ok(());
+    };
+    if current_identity != saved_identity {
+        CredentialStore::default().save(OVERLEAF_SERVER, current_identity.clone())?;
+    }
+    Ok(())
 }
 
 async fn list_remote_projects() -> Result<Vec<RemoteProject>> {
-    let projects = native_http_client().await?.list_projects().await?;
+    let (mut client, saved_identity) = native_http_client().await?;
+    let projects = client.list_projects().await?;
+    persist_rotated_identity(&client, &saved_identity)?;
     projects
         .into_iter()
         .map(|mut value| {
@@ -2014,10 +2068,9 @@ async fn list_remote_projects() -> Result<Vec<RemoteProject>> {
 }
 
 async fn create_remote_project(name: &str) -> Result<()> {
-    native_http_client()
-        .await?
-        .create_project(name, "none")
-        .await?;
+    let (mut client, saved_identity) = native_http_client().await?;
+    client.create_project(name, "none").await?;
+    persist_rotated_identity(&client, &saved_identity)?;
     Ok(())
 }
 
@@ -2285,6 +2338,29 @@ mod tests {
         };
         assert_eq!(trashed.bucket_label(), "Trash");
         assert!(trashed.is_read_only_bucket());
+    }
+
+    #[test]
+    fn refresh_keeps_the_last_successful_project_list_visible() {
+        let previous = vec![RemoteProject {
+            id: "paper-1".to_string(),
+            name: "Last known paper".to_string(),
+            access_level: "owner".to_string(),
+            last_updated: None,
+            archived: false,
+            trashed: false,
+        }];
+        let loading = ProjectListState::Loading {
+            previous: previous.clone(),
+        };
+        assert_eq!(loading.projects()[0].id, "paper-1");
+        assert_eq!(loading.summary(), "Refreshing Overleaf projects…");
+
+        let failed =
+            ProjectListState::from_result(Err(anyhow!("temporary network failure")), previous);
+        assert_eq!(failed.projects()[0].name, "Last known paper");
+        assert_eq!(failed.summary(), "Showing the last update. Refresh failed.");
+        assert_eq!(failed.detail(), Some("temporary network failure"));
     }
 
     #[test]
