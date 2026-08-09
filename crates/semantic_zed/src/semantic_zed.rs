@@ -505,8 +505,12 @@ impl PaperPanel {
                 match result {
                     Ok((handle, status)) => {
                         this.native_sync = Some(handle);
-                        this.apply_native_status(status, window, cx);
+                        // Subscribe and reset the per-socket cursor publisher before
+                        // applying the live status. Applying it queues the active
+                        // editor caret; doing the reset afterwards used to cancel
+                        // that first publication until the user moved again.
                         this.restart_native_event_stream(window, cx);
+                        this.apply_native_status(status, window, cx);
                     }
                     Err(error) => {
                         this.status = PaperStatus::Error(error.to_string());
