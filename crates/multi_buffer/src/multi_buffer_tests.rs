@@ -4336,6 +4336,70 @@ fn test_history(cx: &mut App) {
 }
 
 #[gpui::test]
+fn test_external_edit_sources_do_not_enter_user_undo(cx: &mut App) {
+    let buffer_1 = cx.new(|cx| Buffer::local("abc", cx));
+    let buffer_2 = cx.new(|cx| Buffer::local("def", cx));
+    let multibuffer = cx.new(|_| MultiBuffer::new(Capability::ReadWrite));
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(0),
+            buffer_1.clone(),
+            [Point::zero()..buffer_1.read(cx).max_point()],
+            0,
+            cx,
+        );
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(1),
+            buffer_2.clone(),
+            [Point::zero()..buffer_2.read(cx).max_point()],
+            0,
+            cx,
+        );
+
+        multibuffer.start_transaction(cx);
+        multibuffer.edit([(Point::new(0, 0)..Point::new(0, 0), "U")], None, cx);
+        let user_transaction = multibuffer
+            .end_transaction_with_source(language::BufferEditSource::User, cx)
+            .unwrap();
+
+        multibuffer.start_transaction(cx);
+        multibuffer.edit([(Point::new(0, 4)..Point::new(0, 4), "A")], None, cx);
+        let agent_transaction = multibuffer
+            .end_transaction_with_source(language::BufferEditSource::Agent, cx)
+            .unwrap();
+
+        multibuffer.start_transaction(cx);
+        multibuffer.edit([(Point::new(1, 3)..Point::new(1, 3), "R")], None, cx);
+        let remote_transaction = multibuffer
+            .end_transaction_with_source(language::BufferEditSource::Remote, cx)
+            .unwrap();
+
+        assert_eq!(multibuffer.read(cx).text(), "UabcA\ndefR");
+        assert_eq!(multibuffer.last_transaction_id(cx), Some(user_transaction));
+        assert!(
+            !multibuffer
+                .edited_ranges_for_transaction(agent_transaction, cx)
+                .is_empty()
+        );
+        assert!(
+            multibuffer
+                .edited_ranges_for_transaction(remote_transaction, cx)
+                .is_empty()
+        );
+
+        assert_eq!(multibuffer.undo(cx), Some(user_transaction));
+        assert_eq!(multibuffer.read(cx).text(), "abcA\ndefR");
+        assert_eq!(multibuffer.redo(cx), Some(user_transaction));
+        assert_eq!(multibuffer.read(cx).text(), "UabcA\ndefR");
+
+        multibuffer.undo_transaction(agent_transaction, cx);
+        assert_eq!(multibuffer.read(cx).text(), "Uabc\ndefR");
+        multibuffer.undo_transaction(remote_transaction, cx);
+        assert_eq!(multibuffer.read(cx).text(), "Uabc\ndefR");
+    });
+}
+
+#[gpui::test]
 async fn test_enclosing_indent(cx: &mut TestAppContext) {
     async fn enclosing_indent(
         text: &str,

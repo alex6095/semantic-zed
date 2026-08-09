@@ -260,7 +260,7 @@ impl History {
         }
     }
 
-    fn end_transaction(&mut self, now: Instant) -> Option<&HistoryEntry> {
+    fn end_transaction(&mut self, now: Instant, clear_redo: bool) -> Option<&HistoryEntry> {
         assert_ne!(self.transaction_depth, 0);
         self.transaction_depth -= 1;
         if self.transaction_depth == 0 {
@@ -275,7 +275,9 @@ impl History {
                 self.undo_stack.pop();
                 None
             } else {
-                self.redo_stack.clear();
+                if clear_redo {
+                    self.redo_stack.clear();
+                }
                 let entry = self.undo_stack.last_mut().unwrap();
                 entry.last_edit_at = now;
                 Some(entry)
@@ -1324,13 +1326,29 @@ impl Buffer {
     }
 
     pub fn end_transaction_at(&mut self, now: Instant) -> Option<(TransactionId, clock::Global)> {
-        if let Some(entry) = self.history.end_transaction(now) {
+        if let Some(entry) = self.history.end_transaction(now, true) {
             let since = entry.transaction.start.clone();
             let id = self.history.group().unwrap();
             Some((id, since))
         } else {
             None
         }
+    }
+
+    /// Ends a transaction without placing it in the normal user undo/redo history.
+    ///
+    /// This is used for external edit domains such as an agent or a remote service. It preserves
+    /// the user's redo stack and returns the detached transaction so the caller may retain it in a
+    /// separate review history.
+    pub fn end_transaction_at_detached(
+        &mut self,
+        now: Instant,
+    ) -> Option<(Transaction, clock::Global)> {
+        let entry = self.history.end_transaction(now, false)?;
+        let since = entry.transaction.start.clone();
+        let id = entry.transaction.id;
+        let transaction = self.history.forget(id)?;
+        Some((transaction, since))
     }
 
     pub fn finalize_last_transaction(&mut self) -> Option<&Transaction> {
@@ -1367,6 +1385,11 @@ impl Buffer {
             .transaction
             .clone();
         Some(self.undo_or_redo(transaction))
+    }
+
+    /// Toggles a transaction that is intentionally not part of the user undo/redo stacks.
+    pub fn undo_detached_transaction(&mut self, transaction: Transaction) -> Operation {
+        self.undo_or_redo(transaction)
     }
 
     pub fn undo_to_transaction(&mut self, transaction_id: TransactionId) -> Vec<Operation> {

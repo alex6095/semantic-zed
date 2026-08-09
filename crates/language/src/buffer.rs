@@ -113,6 +113,9 @@ pub struct Buffer {
     preview_version: clock::Global,
     transaction_depth: usize,
     was_dirty_before_starting_transaction: Option<bool>,
+    /// Agent transactions live outside the user's Cmd/Ctrl+Z history. They remain addressable by
+    /// transaction id so review surfaces can offer an explicit Revert action.
+    agent_transactions: HashMap<TransactionId, Transaction>,
     reload_task: Option<Task<Result<()>>>,
     language: Option<Arc<Language>>,
     autoindent_requests: Vec<Arc<AutoindentRequest>>,
@@ -1124,6 +1127,7 @@ impl Buffer {
             reload_task: None,
             transaction_depth: 0,
             was_dirty_before_starting_transaction: None,
+            agent_transactions: HashMap::default(),
             has_unsaved_edits: Cell::new((buffer.version(), false)),
             text: buffer,
             branch_state: None,
@@ -2554,7 +2558,24 @@ impl Buffer {
         } else {
             false
         };
-        if let Some((transaction_id, start_version)) = self.text.end_transaction_at(now) {
+        let completed = match source {
+            BufferEditSource::User => self.text.end_transaction_at(now),
+            BufferEditSource::Agent | BufferEditSource::Remote => {
+                self.text
+                    .end_transaction_at_detached(now)
+                    .map(|(transaction, start_version)| {
+                        let transaction_id = transaction.id;
+                        if source == BufferEditSource::Agent {
+                            self.agent_transactions.insert(transaction_id, transaction);
+                        }
+                        // User edits on either side of an external edit must never be grouped
+                        // across it, even though the external transaction is detached.
+                        self.text.finalize_last_transaction();
+                        (transaction_id, start_version)
+                    })
+            }
+        };
+        if let Some((transaction_id, start_version)) = completed {
             self.did_edit(&start_version, was_dirty, source, cx);
             Some(transaction_id)
         } else {
@@ -2595,17 +2616,43 @@ impl Buffer {
 
     /// Manually remove a transaction from the buffer's undo history
     pub fn forget_transaction(&mut self, transaction_id: TransactionId) -> Option<Transaction> {
-        self.text.forget_transaction(transaction_id)
+        self.text
+            .forget_transaction(transaction_id)
+            .or_else(|| self.agent_transactions.remove(&transaction_id))
     }
 
     /// Retrieve a transaction from the buffer's undo history
     pub fn get_transaction(&self, transaction_id: TransactionId) -> Option<&Transaction> {
-        self.text.get_transaction(transaction_id)
+        self.text
+            .get_transaction(transaction_id)
+            .or_else(|| self.agent_transactions.get(&transaction_id))
     }
 
     /// Manually merge two transactions in the buffer's undo history.
     pub fn merge_transactions(&mut self, transaction: TransactionId, destination: TransactionId) {
-        self.text.merge_transactions(transaction, destination);
+        if let Some(transaction) = self.agent_transactions.remove(&transaction) {
+            if let Some(destination) = self.agent_transactions.get_mut(&destination) {
+                destination.merge_in(transaction);
+            } else {
+                self.agent_transactions.insert(transaction.id, transaction);
+            }
+        } else {
+            self.text.merge_transactions(transaction, destination);
+        }
+    }
+
+    /// Returns the ranges changed by either a user-history transaction or a detached agent
+    /// transaction.
+    pub fn edited_ranges_for_transaction_id<D>(
+        &self,
+        transaction_id: TransactionId,
+    ) -> impl '_ + Iterator<Item = Range<D>>
+    where
+        D: TextDimension,
+    {
+        self.get_transaction(transaction_id)
+            .into_iter()
+            .flat_map(|transaction| self.text.edited_ranges_for_transaction(transaction))
     }
 
     /// Waits for the buffer to receive operations with the given timestamps.
@@ -3298,9 +3345,21 @@ impl Buffer {
     ) -> bool {
         let was_dirty = self.is_dirty();
         let old_version = self.version.clone();
-        if let Some(operation) = self.text.undo_transaction(transaction_id) {
+        let (operation, source) =
+            if let Some(transaction) = self.agent_transactions.remove(&transaction_id) {
+                (
+                    Some(self.text.undo_detached_transaction(transaction)),
+                    BufferEditSource::Agent,
+                )
+            } else {
+                (
+                    self.text.undo_transaction(transaction_id),
+                    BufferEditSource::User,
+                )
+            };
+        if let Some(operation) = operation {
             self.send_operation(Operation::Buffer(operation), true, cx);
-            self.did_edit(&old_version, was_dirty, BufferEditSource::User, cx);
+            self.did_edit(&old_version, was_dirty, source, cx);
             true
         } else {
             false

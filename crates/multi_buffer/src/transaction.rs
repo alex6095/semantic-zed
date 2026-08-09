@@ -17,6 +17,7 @@ pub(super) struct History {
     next_transaction_id: TransactionId,
     undo_stack: Vec<Transaction>,
     redo_stack: Vec<Transaction>,
+    agent_transactions: HashMap<TransactionId, Transaction>,
     transaction_depth: usize,
     group_interval: Duration,
 }
@@ -27,6 +28,7 @@ impl Default for History {
             next_transaction_id: clock::Lamport::MIN,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            agent_transactions: HashMap::new(),
             transaction_depth: 0,
             group_interval: Duration::from_millis(300),
         }
@@ -64,6 +66,7 @@ impl History {
         &mut self,
         now: Instant,
         buffer_transactions: HashMap<BufferId, text::TransactionId>,
+        clear_redo: bool,
     ) -> bool {
         assert_ne!(self.transaction_depth, 0);
         self.transaction_depth -= 1;
@@ -72,7 +75,9 @@ impl History {
                 self.undo_stack.pop();
                 false
             } else {
-                self.redo_stack.clear();
+                if clear_redo {
+                    self.redo_stack.clear();
+                }
                 let transaction = self.undo_stack.last_mut().unwrap();
                 transaction.last_edit_at = now;
                 for (buffer_id, transaction_id) in buffer_transactions {
@@ -133,7 +138,7 @@ impl History {
         {
             Some(self.redo_stack.remove(ix))
         } else {
-            None
+            self.agent_transactions.remove(&transaction_id)
         }
     }
 
@@ -146,6 +151,7 @@ impl History {
                     .iter()
                     .find(|transaction| transaction.id == transaction_id)
             })
+            .or_else(|| self.agent_transactions.get(&transaction_id))
     }
 
     fn transaction_mut(&mut self, transaction_id: TransactionId) -> Option<&mut Transaction> {
@@ -157,6 +163,7 @@ impl History {
                     .iter_mut()
                     .find(|transaction| transaction.id == transaction_id)
             })
+            .or_else(|| self.agent_transactions.get_mut(&transaction_id))
     }
 
     fn pop_undo(&mut self) -> Option<&mut Transaction> {
@@ -309,9 +316,24 @@ impl MultiBuffer {
             }
         }
 
-        if self.history.end_transaction(now, buffer_transactions) {
-            let transaction_id = self.history.group().unwrap();
-            Some(transaction_id)
+        if self
+            .history
+            .end_transaction(now, buffer_transactions, source == BufferEditSource::User)
+        {
+            if source == BufferEditSource::User {
+                Some(self.history.group().unwrap())
+            } else {
+                let transaction = self.history.undo_stack.pop()?;
+                let transaction_id = transaction.id;
+                if source == BufferEditSource::Agent {
+                    self.history
+                        .agent_transactions
+                        .insert(transaction_id, transaction);
+                }
+                // Do not group user edits across an external agent/remote update.
+                self.history.finalize_last_transaction();
+                Some(transaction_id)
+            }
         } else {
             None
         }
@@ -335,7 +357,7 @@ impl MultiBuffer {
             }
         }
 
-        if self.history.end_transaction(now, buffer_transactions) {
+        if self.history.end_transaction(now, buffer_transactions, true) {
             let transaction_id = self.history.group().unwrap();
             Some(transaction_id)
         } else {
@@ -517,6 +539,14 @@ impl MultiBuffer {
     pub fn undo_transaction(&mut self, transaction_id: TransactionId, cx: &mut Context<Self>) {
         if let Some(buffer) = self.as_singleton() {
             buffer.update(cx, |buffer, cx| buffer.undo_transaction(transaction_id, cx));
+        } else if let Some(transaction) = self.history.agent_transactions.remove(&transaction_id) {
+            for (buffer_id, transaction_id) in &transaction.buffer_transactions {
+                if let Some(BufferState { buffer, .. }) = self.buffers.get(buffer_id) {
+                    buffer.update(cx, |buffer, cx| {
+                        buffer.undo_transaction(*transaction_id, cx)
+                    });
+                }
+            }
         } else if let Some(transaction) = self.history.remove_from_undo(transaction_id) {
             for (buffer_id, transaction_id) in &transaction.buffer_transactions {
                 if let Some(BufferState { buffer, .. }) = self.buffers.get(buffer_id) {

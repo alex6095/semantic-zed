@@ -649,6 +649,34 @@ fn test_history() {
 }
 
 #[test]
+fn test_detached_transaction_is_not_in_user_undo_and_preserves_redo() {
+    let now = Instant::now();
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "abc");
+
+    buffer.start_transaction_at(now);
+    buffer.edit([(0..0, "U")]);
+    buffer.end_transaction_at(now).unwrap();
+    assert_eq!(buffer.text(), "Uabc");
+
+    buffer.undo().unwrap();
+    assert_eq!(buffer.text(), "abc");
+
+    buffer.start_transaction_at(now);
+    buffer.edit([(3..3, "A")]);
+    let (agent_transaction, _) = buffer.end_transaction_at_detached(now).unwrap();
+    assert_eq!(buffer.text(), "abcA");
+
+    buffer.redo().unwrap();
+    assert_eq!(buffer.text(), "UabcA");
+
+    buffer.undo().unwrap();
+    assert_eq!(buffer.text(), "abcA");
+
+    buffer.undo_detached_transaction(agent_transaction);
+    assert_eq!(buffer.text(), "abc");
+}
+
+#[test]
 fn test_finalize_last_transaction() {
     let now = Instant::now();
     let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "123456");
