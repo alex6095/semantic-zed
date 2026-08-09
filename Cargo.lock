@@ -3175,6 +3175,7 @@ dependencies = [
  "release_channel",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "util",
  "walkdir",

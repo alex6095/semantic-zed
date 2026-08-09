@@ -72,6 +72,30 @@ pub enum CliRequest {
     SetOpenBehavior {
         behavior: CliBehaviorSetting,
     },
+    RegisterAgentEdit {
+        edit: AgentEditDeclaration,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEditPhase {
+    Begin,
+    End,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEditFile {
+    pub path: PathBuf,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEditDeclaration {
+    pub phase: AgentEditPhase,
+    pub agent: String,
+    pub task_id: String,
+    pub files: Vec<AgentEditFile>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

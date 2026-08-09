@@ -304,6 +304,10 @@ pub enum Operation {
 pub enum BufferEditSource {
     User,
     Agent,
+    /// A change observed on disk whose author did not provide trusted provenance.
+    /// External changes are local to this machine, but must not be folded into the
+    /// editor user's undo/redo history.
+    External,
     Remote,
 }
 
@@ -1588,6 +1592,21 @@ impl Buffer {
         self.reload_impl(None, BufferEditSource::Remote, cx)
     }
 
+    /// Reloads a change made by another local process. Verified agent changes are retained in
+    /// the separate agent transaction store; unattributed external changes are detached from all
+    /// undo/redo histories.
+    pub fn reload_from_external(
+        &mut self,
+        source: BufferEditSource,
+        cx: &Context<Self>,
+    ) -> oneshot::Receiver<Option<Transaction>> {
+        assert!(matches!(
+            source,
+            BufferEditSource::Agent | BufferEditSource::External
+        ));
+        self.reload_impl(None, source, cx)
+    }
+
     /// Reloads the contents of the buffer from disk using the specified encoding.
     ///
     /// This bypasses automatic encoding detection heuristics (like BOM checks) for non-Unicode encodings,
@@ -2583,7 +2602,7 @@ impl Buffer {
         };
         let completed = match source {
             BufferEditSource::User => self.text.end_transaction_at(now),
-            BufferEditSource::Agent | BufferEditSource::Remote => {
+            BufferEditSource::Agent | BufferEditSource::External | BufferEditSource::Remote => {
                 self.text
                     .end_transaction_at_detached(now)
                     .map(|(transaction, start_version)| {

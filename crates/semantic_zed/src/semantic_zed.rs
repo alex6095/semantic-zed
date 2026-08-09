@@ -1032,6 +1032,7 @@ impl PaperPanel {
         let origin = match source {
             BufferEditSource::User => "editor",
             BufferEditSource::Agent => "agent",
+            BufferEditSource::External => "external",
             BufferEditSource::Remote => return,
         };
         let Some(root) = self.paper_root.as_ref() else {

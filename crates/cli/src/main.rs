@@ -13,8 +13,12 @@ use crate::completions::Shell;
 
 use anyhow::{Context as _, Result};
 use clap::{CommandFactory, Parser};
-use cli::{CliRequest, CliResponse, IpcHandshake, ipc::IpcOneShotServer};
+use cli::{
+    AgentEditDeclaration, AgentEditFile, AgentEditPhase, CliRequest, CliResponse, IpcHandshake,
+    ipc::IpcOneShotServer,
+};
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -153,6 +157,113 @@ struct Args {
     /// by having Zed act like netcat communicating over a Unix socket.
     #[arg(long, hide = true)]
     askpass: Option<String>,
+
+    /// Declare the start of a file edit performed by an external agent integration.
+    #[arg(
+        long,
+        value_name = "AGENT",
+        hide = true,
+        conflicts_with = "agent_edit_end",
+        requires = "agent_task_id"
+    )]
+    agent_edit_begin: Option<String>,
+
+    /// Declare the end of a file edit performed by an external agent integration.
+    #[arg(
+        long,
+        value_name = "AGENT",
+        hide = true,
+        conflicts_with = "agent_edit_begin",
+        requires = "agent_task_id"
+    )]
+    agent_edit_end: Option<String>,
+
+    /// Stable task or session identifier supplied by the external agent.
+    #[arg(long, value_name = "TASK_ID", hide = true)]
+    agent_task_id: Option<String>,
+}
+
+fn build_agent_edit_declaration(args: &Args) -> Result<Option<AgentEditDeclaration>> {
+    let (phase, agent) = match (&args.agent_edit_begin, &args.agent_edit_end) {
+        (Some(agent), None) => (AgentEditPhase::Begin, agent),
+        (None, Some(agent)) => (AgentEditPhase::End, agent),
+        (None, None) => {
+            anyhow::ensure!(
+                args.agent_task_id.is_none(),
+                "--agent-task-id requires --agent-edit-begin or --agent-edit-end"
+            );
+            return Ok(None);
+        }
+        (Some(_), Some(_)) => unreachable!("clap rejects conflicting edit phases"),
+    };
+    let task_id = args
+        .agent_task_id
+        .as_ref()
+        .context("an agent edit requires --agent-task-id")?;
+    anyhow::ensure!(!agent.trim().is_empty(), "agent must not be empty");
+    anyhow::ensure!(
+        !task_id.trim().is_empty(),
+        "agent task id must not be empty"
+    );
+    anyhow::ensure!(
+        args.diff.is_empty(),
+        "agent edit declarations do not accept --diff"
+    );
+    anyhow::ensure!(
+        !args.paths_with_position.is_empty(),
+        "an agent edit declaration requires at least one file path"
+    );
+
+    let mut files = Vec::with_capacity(args.paths_with_position.len());
+    for raw_path in &args.paths_with_position {
+        anyhow::ensure!(
+            !URL_PREFIX.iter().any(|prefix| raw_path.starts_with(prefix)) && raw_path != "-",
+            "agent edit declarations accept file paths only"
+        );
+        let path = normalize_agent_edit_path(Path::new(raw_path))?;
+        anyhow::ensure!(!path.is_dir(), "{} is a directory", path.display());
+        files.push(AgentEditFile {
+            sha256: normalized_utf8_file_sha256(&path)?,
+            path,
+        });
+    }
+
+    Ok(Some(AgentEditDeclaration {
+        phase,
+        agent: agent.clone(),
+        task_id: task_id.clone(),
+        files,
+    }))
+}
+
+fn normalize_agent_edit_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    let parent = absolute
+        .parent()
+        .with_context(|| format!("{} has no parent directory", absolute.display()))?
+        .canonicalize()
+        .with_context(|| format!("resolving parent of {}", absolute.display()))?;
+    let file_name = absolute
+        .file_name()
+        .with_context(|| format!("{} has no file name", absolute.display()))?;
+    Ok(parent.join(file_name))
+}
+
+fn normalized_utf8_file_sha256(path: &Path) -> Result<Option<String>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading agent edit file {}", path.display()));
+        }
+    };
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    Ok(Some(format!("{:x}", Sha256::digest(normalized.as_bytes()))))
 }
 
 /// Parses a path containing a position (e.g. `path:line:column`)
@@ -340,6 +451,35 @@ mod tests {
     }
 
     #[test]
+    fn builds_verified_external_agent_edit_declarations() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("paper.tex");
+        fs::write(&path, "before\r\n").unwrap();
+        let args = Args::try_parse_from([
+            "zed",
+            "--agent-edit-begin",
+            "codex",
+            "--agent-task-id",
+            "task-42",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let declaration = build_agent_edit_declaration(&args).unwrap().unwrap();
+        assert_eq!(declaration.phase, AgentEditPhase::Begin);
+        assert_eq!(declaration.agent, "codex");
+        assert_eq!(declaration.task_id, "task-42");
+        assert_eq!(
+            declaration.files[0].path,
+            normalize_agent_edit_path(&path).unwrap()
+        );
+        assert_eq!(
+            declaration.files[0].sha256,
+            Some(format!("{:x}", Sha256::digest(b"before\n")))
+        );
+    }
+
+    #[test]
     fn test_parse_non_existing_path() {
         // Absolute path
         let result = parse_path_with_position(path!("/non/existing/path.txt")).unwrap();
@@ -511,6 +651,7 @@ fn run() -> Result<()> {
     }
 
     let args = Args::parse();
+    let agent_edit_declaration = build_agent_edit_declaration(&args)?;
 
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
     if let Some(socket) = &args.askpass {
@@ -717,21 +858,25 @@ fn run() -> Result<()> {
                 #[cfg(not(target_os = "windows"))]
                 let wsl = None;
 
-                let open_request = CliRequest::Open {
-                    paths,
-                    urls,
-                    diff_paths,
-                    diff_all: diff_all_mode,
-                    wsl,
-                    wait: args.wait,
-                    open_behavior,
-                    env,
-                    user_data_dir: user_data_dir_for_thread,
-                    dev_container: args.dev_container,
-                    cwd: env::current_dir().ok(),
+                let request = if let Some(edit) = agent_edit_declaration {
+                    CliRequest::RegisterAgentEdit { edit }
+                } else {
+                    CliRequest::Open {
+                        paths,
+                        urls,
+                        diff_paths,
+                        diff_all: diff_all_mode,
+                        wsl,
+                        wait: args.wait,
+                        open_behavior,
+                        env,
+                        user_data_dir: user_data_dir_for_thread,
+                        dev_container: args.dev_container,
+                        cwd: env::current_dir().ok(),
+                    }
                 };
 
-                tx.send(open_request)?;
+                tx.send(request)?;
 
                 while let Ok(response) = rx.recv() {
                     match response {

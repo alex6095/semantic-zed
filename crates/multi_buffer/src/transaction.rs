@@ -330,7 +330,8 @@ impl MultiBuffer {
                         .agent_transactions
                         .insert(transaction_id, transaction);
                 }
-                // Do not group user edits across an external agent/remote update.
+                // Do not group user edits across an agent, unattributed external, or remote
+                // update.
                 self.history.finalize_last_transaction();
                 Some(transaction_id)
             }

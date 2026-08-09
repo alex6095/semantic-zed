@@ -676,6 +676,46 @@ pub async fn handle_cli_connection(
                 // resolve_open_behavior
                 debug_panic!("unexpected SetOpenBehavior message");
             }
+            CliRequest::RegisterAgentEdit { edit } => {
+                let phase = match edit.phase {
+                    cli::AgentEditPhase::Begin => project::ExternalAgentEditPhase::Begin,
+                    cli::AgentEditPhase::End => project::ExternalAgentEditPhase::End,
+                };
+                let request = project::ExternalAgentEditRequest {
+                    phase,
+                    agent: edit.agent,
+                    task_id: edit.task_id,
+                    files: edit
+                        .files
+                        .into_iter()
+                        .map(|file| project::ExternalAgentEditFile {
+                            path: file.path,
+                            sha256: file.sha256,
+                        })
+                        .collect(),
+                };
+                let result = cx.update(|cx| project::register_external_agent_edit(request, cx));
+                match result {
+                    Ok(file_count) => {
+                        responses
+                            .send(CliResponse::Stdout {
+                                message: format!(
+                                    "registered external agent edit provenance for {file_count} file(s)"
+                                ),
+                            })
+                            .log_err();
+                        responses.send(CliResponse::Exit { status: 0 }).log_err();
+                    }
+                    Err(error) => {
+                        responses
+                            .send(CliResponse::Stderr {
+                                message: format!("could not register agent edit: {error:#}"),
+                            })
+                            .log_err();
+                        responses.send(CliResponse::Exit { status: 1 }).log_err();
+                    }
+                }
+            }
         }
     }
 }

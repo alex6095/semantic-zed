@@ -12,7 +12,8 @@ use gpui::{
     WeakEntity,
 };
 use language::{
-    Buffer, BufferEvent, Capability, DiskState, File as _, Language, LineEnding, Operation,
+    Buffer, BufferEditSource, BufferEvent, Capability, DiskState, File as _, Language, LineEnding,
+    Operation,
     language_settings::{AllLanguageSettings, LineEndingSetting},
     proto::{
         deserialize_line_ending, deserialize_version, serialize_line_ending, serialize_version,
@@ -773,6 +774,30 @@ impl LocalBufferStore {
             Ok(project_transaction)
         })
     }
+
+    fn reload_buffers_from_external(
+        &self,
+        buffers: HashSet<Entity<Buffer>>,
+        source: BufferEditSource,
+        cx: &mut Context<BufferStore>,
+    ) -> Task<Result<ProjectTransaction>> {
+        debug_assert!(matches!(
+            source,
+            BufferEditSource::Agent | BufferEditSource::External
+        ));
+        cx.spawn(async move |_, cx| {
+            let mut project_transaction = ProjectTransaction::default();
+            for buffer in buffers {
+                let transaction = buffer
+                    .update(cx, |buffer, cx| buffer.reload_from_external(source, cx))
+                    .await?;
+                if let Some(transaction) = transaction {
+                    project_transaction.0.insert(buffer, transaction);
+                }
+            }
+            Ok(project_transaction)
+        })
+    }
 }
 
 impl BufferStore {
@@ -1521,6 +1546,24 @@ impl BufferStore {
         match &self.state {
             BufferStoreState::Local(this) => this.reload_buffers(buffers, push_to_history, cx),
             BufferStoreState::Remote(this) => this.reload_buffers(buffers, push_to_history, cx),
+        }
+    }
+
+    pub fn reload_buffers_from_external(
+        &self,
+        buffers: HashSet<Entity<Buffer>>,
+        source: BufferEditSource,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ProjectTransaction>> {
+        if buffers.is_empty() {
+            return Task::ready(Ok(ProjectTransaction::default()));
+        }
+        match &self.state {
+            BufferStoreState::Local(this) => this.reload_buffers_from_external(buffers, source, cx),
+            BufferStoreState::Remote(this) => {
+                debug_panic!("external filesystem reload requested for a remote buffer store");
+                this.reload_buffers(buffers, false, cx)
+            }
         }
     }
 

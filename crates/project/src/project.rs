@@ -25,9 +25,14 @@ pub mod trusted_worktrees;
 pub mod worktree_store;
 
 mod environment;
+pub mod external_agent_provenance;
 use buffer_diff::BufferDiff;
 use context_server_store::ContextServerStore;
 pub use environment::ProjectEnvironmentEvent;
+pub use external_agent_provenance::{
+    ExternalAgentEditAttribution, ExternalAgentEditFile, ExternalAgentEditPhase,
+    ExternalAgentEditRequest, register_external_agent_edit,
+};
 use git::repository::get_git_committer;
 use git_store::{Repository, RepositoryId};
 pub mod search_history;
@@ -427,6 +432,7 @@ pub enum Event {
     BufferEdited {
         source: BufferEditSource,
     },
+    ExternalAgentEditDetected(ExternalAgentEditAttribution),
 }
 
 pub struct AgentLocationChanged;
@@ -1148,25 +1154,33 @@ impl DisableAiSettings {
     }
 }
 
-/// External writes in a Semantic Zed Overleaf replica are collaboration
-/// updates, not edits authored by this editor instance. Keep them visible in
-/// the buffer while excluding their reload transaction from the local
-/// undo/redo stack. Ordinary projects retain Zed's existing reload history.
-fn external_reload_pushes_to_history(buffer: &Entity<Buffer>, cx: &App) -> bool {
+/// Attribute a filesystem update only when a registered external agent declaration matches its
+/// pre-edit buffer content. Everything else is explicitly external and remains outside the local
+/// user's undo/redo history. Native Overleaf changes bypass this path and call
+/// `Buffer::reload_from_remote` directly.
+fn external_reload_source(
+    buffer: &Entity<Buffer>,
+    cx: &mut App,
+) -> (BufferEditSource, Option<ExternalAgentEditAttribution>) {
     let Some(absolute_path) = buffer.read(cx).file().and_then(|file| {
         let local = file.as_local()?;
         Some(local.abs_path(cx))
     }) else {
-        return true;
+        return (BufferEditSource::External, None);
     };
-
-    !absolute_path
-        .ancestors()
-        .any(|ancestor| ancestor.join(".semantic-zed/project.json").is_file())
+    let text = buffer.read(cx).text();
+    let attribution =
+        external_agent_provenance::match_external_agent_edit(&absolute_path, &text, cx);
+    if attribution.is_some() {
+        (BufferEditSource::Agent, attribution)
+    } else {
+        (BufferEditSource::External, None)
+    }
 }
 
 impl Project {
     pub fn init(client: &Arc<Client>, cx: &mut App) {
+        external_agent_provenance::init(cx);
         connection_manager::init(client.clone(), cx);
 
         let client: AnyProtoClient = client.clone().into();
@@ -3994,13 +4008,19 @@ impl Project {
         match event {
             BufferEvent::ReloadNeeded => {
                 if !self.is_via_collab() {
-                    let push_to_history = external_reload_pushes_to_history(&buffer, cx);
-                    self.reload_buffers(
-                        [buffer.clone()].into_iter().collect(),
-                        push_to_history,
-                        cx,
-                    )
-                    .detach_and_log_err(cx);
+                    let (source, attribution) = external_reload_source(&buffer, cx);
+                    if let Some(attribution) = attribution {
+                        cx.emit(Event::ExternalAgentEditDetected(attribution));
+                    }
+                    self.buffer_store
+                        .update(cx, |buffer_store, cx| {
+                            buffer_store.reload_buffers_from_external(
+                                [buffer.clone()].into_iter().collect(),
+                                source,
+                                cx,
+                            )
+                        })
+                        .detach_and_log_err(cx);
                 }
             }
             BufferEvent::Operation {

@@ -4374,7 +4374,13 @@ fn test_external_edit_sources_do_not_enter_user_undo(cx: &mut App) {
             .end_transaction_with_source(language::BufferEditSource::Remote, cx)
             .unwrap();
 
-        assert_eq!(multibuffer.read(cx).text(), "UabcA\ndefR");
+        multibuffer.start_transaction(cx);
+        multibuffer.edit([(Point::new(1, 4)..Point::new(1, 4), "E")], None, cx);
+        let external_transaction = multibuffer
+            .end_transaction_with_source(language::BufferEditSource::External, cx)
+            .unwrap();
+
+        assert_eq!(multibuffer.read(cx).text(), "UabcA\ndefRE");
         assert_eq!(multibuffer.last_transaction_id(cx), Some(user_transaction));
         assert!(
             !multibuffer
@@ -4386,16 +4392,22 @@ fn test_external_edit_sources_do_not_enter_user_undo(cx: &mut App) {
                 .edited_ranges_for_transaction(remote_transaction, cx)
                 .is_empty()
         );
+        assert!(
+            multibuffer
+                .edited_ranges_for_transaction(external_transaction, cx)
+                .is_empty()
+        );
 
         assert_eq!(multibuffer.undo(cx), Some(user_transaction));
-        assert_eq!(multibuffer.read(cx).text(), "abcA\ndefR");
+        assert_eq!(multibuffer.read(cx).text(), "abcA\ndefRE");
         assert_eq!(multibuffer.redo(cx), Some(user_transaction));
-        assert_eq!(multibuffer.read(cx).text(), "UabcA\ndefR");
+        assert_eq!(multibuffer.read(cx).text(), "UabcA\ndefRE");
 
         multibuffer.undo_transaction(agent_transaction, cx);
-        assert_eq!(multibuffer.read(cx).text(), "Uabc\ndefR");
+        assert_eq!(multibuffer.read(cx).text(), "Uabc\ndefRE");
         multibuffer.undo_transaction(remote_transaction, cx);
-        assert_eq!(multibuffer.read(cx).text(), "Uabc\ndefR");
+        multibuffer.undo_transaction(external_transaction, cx);
+        assert_eq!(multibuffer.read(cx).text(), "Uabc\ndefRE");
     });
 }
 

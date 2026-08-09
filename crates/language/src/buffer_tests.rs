@@ -542,23 +542,31 @@ fn test_external_edit_sources_do_not_enter_user_undo(cx: &mut gpui::App) {
             .end_transaction_with_source(BufferEditSource::Remote, cx)
             .unwrap();
 
-        assert_eq!(buffer.text(), "UabcAR");
+        buffer.start_transaction();
+        buffer.edit([(buffer.len()..buffer.len(), "E")], None, cx);
+        let external_transaction = buffer
+            .end_transaction_with_source(BufferEditSource::External, cx)
+            .unwrap();
+
+        assert_eq!(buffer.text(), "UabcARE");
         assert_eq!(
             buffer.peek_undo_stack().map(|entry| entry.transaction_id()),
             Some(user_transaction)
         );
         assert!(buffer.get_transaction(agent_transaction).is_some());
         assert!(buffer.get_transaction(remote_transaction).is_none());
+        assert!(buffer.get_transaction(external_transaction).is_none());
 
         buffer.undo(cx);
-        assert_eq!(buffer.text(), "abcAR");
+        assert_eq!(buffer.text(), "abcARE");
         buffer.redo(cx);
-        assert_eq!(buffer.text(), "UabcAR");
+        assert_eq!(buffer.text(), "UabcARE");
 
         assert!(buffer.undo_transaction(agent_transaction, cx));
-        assert_eq!(buffer.text(), "UabcR");
+        assert_eq!(buffer.text(), "UabcRE");
         assert!(!buffer.undo_transaction(remote_transaction, cx));
-        assert_eq!(buffer.text(), "UabcR");
+        assert!(!buffer.undo_transaction(external_transaction, cx));
+        assert_eq!(buffer.text(), "UabcRE");
     });
 }
 
