@@ -16,8 +16,8 @@ use semantic_overleaf::{
     credentials::CredentialStore,
     http::{Identity, OverleafHttpClient},
     sync::{
-        NativePresence, NativeProjectConfig, NativeStatus, NativeSyncError, NativeSyncEvent,
-        NativeSyncHandle,
+        NativePresence, NativeProjectConfig, NativeSnapshotMaterialization, NativeStatus,
+        NativeSyncError, NativeSyncEvent, NativeSyncHandle,
     },
 };
 use serde::Deserialize;
@@ -128,6 +128,7 @@ pub struct PaperPanel {
     presence_task: Task<()>,
     compile_task: Task<()>,
     save_compile_task: Task<()>,
+    saved_document_task: Task<()>,
     cursor_task: Task<()>,
     document_push_task: Task<()>,
     workspace: WeakEntity<Workspace>,
@@ -146,6 +147,7 @@ pub struct PaperPanel {
     native_sync: Option<NativeSyncHandle>,
     native_sync_starting_root: Option<PathBuf>,
     pending_documents: HashMap<String, PendingDocumentSnapshot>,
+    in_flight_documents: HashMap<String, String>,
     last_submitted_documents: HashMap<String, String>,
     document_push_worker_running: bool,
     subscriptions: Vec<Subscription>,
@@ -186,6 +188,7 @@ impl PaperPanel {
             presence_task: Task::ready(()),
             compile_task: Task::ready(()),
             save_compile_task: Task::ready(()),
+            saved_document_task: Task::ready(()),
             cursor_task: Task::ready(()),
             document_push_task: Task::ready(()),
             workspace: workspace_handle,
@@ -204,6 +207,7 @@ impl PaperPanel {
             native_sync: None,
             native_sync_starting_root: None,
             pending_documents: HashMap::default(),
+            in_flight_documents: HashMap::default(),
             last_submitted_documents: HashMap::default(),
             document_push_worker_running: false,
             subscriptions: Vec::new(),
@@ -308,6 +312,7 @@ impl PaperPanel {
                     if let Some(editor) = item.upgrade().and_then(|item| item.act_as::<Editor>(cx))
                         && this.editor_belongs_to_replica(&editor, cx)
                     {
+                        this.mark_saved_editor_document(&editor, window, cx);
                         this.schedule_compile_after_save(window, cx);
                     }
                 }
@@ -836,6 +841,55 @@ impl PaperPanel {
         });
     }
 
+    fn mark_saved_editor_document(
+        &mut self,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.paper_root.as_ref() else {
+            return;
+        };
+        let Some(handle) = self.native_sync.clone() else {
+            return;
+        };
+        let Some(buffer) = editor.read(cx).active_buffer(cx) else {
+            return;
+        };
+        let Some(path) = buffer_relative_path(&buffer, root, cx) else {
+            return;
+        };
+        let text = buffer.read(cx).text();
+        let tokio = Tokio::handle(cx);
+        self.saved_document_task = cx.spawn_in(window, async move |this, cx| {
+            let result = tokio
+                .spawn(async move {
+                    handle
+                        .apply_snapshot(path.clone(), text.clone(), "editor-save")
+                        .await
+                })
+                .await;
+            this.update(cx, |this, cx| match result {
+                Ok(Ok(snapshot)) => {
+                    this.last_submitted_documents
+                        .insert(snapshot.path, snapshot.text);
+                }
+                Ok(Err(error)) => {
+                    this.project_message = Some(format!(
+                        "Could not confirm the saved editor file with Overleaf: {error}"
+                    ));
+                    cx.notify();
+                }
+                Err(error) => {
+                    this.project_message =
+                        Some(format!("The saved-file Overleaf task stopped: {error}"));
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+    }
+
     fn start_compile(&mut self, reveal_pdf: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.paper_root.clone() else {
             return;
@@ -858,7 +912,10 @@ impl PaperPanel {
         cx.notify();
         let compile_task = Tokio::spawn_result(cx, async move {
             for (path, text) in open_documents {
-                match handle.apply_snapshot(path, text, "compile-barrier").await {
+                match handle
+                    .apply_editor_snapshot(path, text, "compile-barrier")
+                    .await
+                {
                     Ok(_) | Err(NativeSyncError::UnknownDocument(_)) => {}
                     Err(error) => return Err(error.into()),
                 }
@@ -990,7 +1047,13 @@ impl PaperPanel {
             NativeSyncEvent::DocumentChanged { path, text, .. } => {
                 self.last_submitted_documents
                     .insert(path.clone(), text.clone());
-                self.reload_open_document_from_remote(&path, &text, cx);
+                if !self.has_newer_local_document_snapshot(&path, &text) {
+                    // `materialized` is deliberately not used here. An open
+                    // editor can be ahead of its backing file even when this
+                    // event is materialized, so applying the authoritative
+                    // text as a Remote diff is safer than reloading disk.
+                    self.apply_open_document_change_from_remote(&path, text, cx);
+                }
             }
             NativeSyncEvent::PdfChanged { .. } => {
                 if let Some(root) = self.paper_root.clone() {
@@ -1018,14 +1081,25 @@ impl PaperPanel {
         self.presence_task = Task::ready(());
         self.document_push_task = Task::ready(());
         self.pending_documents.clear();
+        self.in_flight_documents.clear();
         self.last_submitted_documents.clear();
         self.document_push_worker_running = false;
     }
 
-    fn reload_open_document_from_remote(
+    fn has_newer_local_document_snapshot(&self, path: &str, text: &str) -> bool {
+        self.pending_documents
+            .get(path)
+            .is_some_and(|snapshot| snapshot.text != text)
+            || self
+                .in_flight_documents
+                .get(path)
+                .is_some_and(|snapshot| snapshot != text)
+    }
+
+    fn apply_open_document_change_from_remote(
         &self,
         document_path: &str,
-        text: &str,
+        text: String,
         cx: &mut Context<Self>,
     ) {
         let Some(root) = self.paper_root.as_ref() else {
@@ -1041,9 +1115,12 @@ impl PaperPanel {
             {
                 continue;
             }
-            let reload = buffer.update(cx, |buffer, cx| buffer.reload_from_remote(cx));
-            cx.spawn(async move |_, _| {
-                let _ = reload.await;
+            let diff = buffer.update(cx, |buffer, cx| buffer.diff(text.clone(), cx));
+            cx.spawn(async move |_, cx| {
+                let diff = diff.await;
+                buffer.update(cx, |buffer, cx| {
+                    buffer.apply_diff_with_source(diff, BufferEditSource::Remote, cx);
+                });
             })
             .detach();
         }
@@ -1056,10 +1133,10 @@ impl PaperPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let origin = match source {
-            BufferEditSource::User => "editor",
-            BufferEditSource::Agent => "agent",
-            BufferEditSource::External => "external",
+        let (origin, materialization) = match source {
+            BufferEditSource::User => ("editor", NativeSnapshotMaterialization::EditorBuffer),
+            BufferEditSource::Agent => ("agent", NativeSnapshotMaterialization::EditorBuffer),
+            BufferEditSource::External => ("external", NativeSnapshotMaterialization::Filesystem),
             BufferEditSource::Remote => return,
         };
         let Some(root) = self.paper_root.as_ref() else {
@@ -1082,8 +1159,14 @@ impl PaperPanel {
             {
                 continue;
             }
-            self.pending_documents
-                .insert(path, PendingDocumentSnapshot { text, origin });
+            self.pending_documents.insert(
+                path,
+                PendingDocumentSnapshot {
+                    text,
+                    origin,
+                    materialization,
+                },
+            );
         }
 
         if self.pending_documents.is_empty() || self.document_push_worker_running {
@@ -1106,23 +1189,34 @@ impl PaperPanel {
                             this.document_push_worker_running = false;
                             return None;
                         }
-                        Some((handle, std::mem::take(&mut this.pending_documents)))
+                        let documents = std::mem::take(&mut this.pending_documents);
+                        this.in_flight_documents.extend(
+                            documents
+                                .iter()
+                                .map(|(path, snapshot)| (path.clone(), snapshot.text.clone())),
+                        );
+                        Some((handle, documents))
                     })
                     .ok()
                     .flatten();
                 let Some((handle, documents)) = batch else {
                     return;
                 };
+                let in_flight = documents
+                    .iter()
+                    .map(|(path, snapshot)| (path.clone(), snapshot.text.clone()))
+                    .collect::<Vec<_>>();
 
                 let result = tokio
                     .spawn(async move {
                         let mut submitted = Vec::with_capacity(documents.len());
                         for (path, snapshot) in documents {
                             handle
-                                .apply_snapshot(
+                                .apply_snapshot_with_materialization(
                                     path.clone(),
                                     snapshot.text.clone(),
                                     snapshot.origin,
+                                    snapshot.materialization,
                                 )
                                 .await?;
                             submitted.push((path, snapshot.text));
@@ -1134,15 +1228,22 @@ impl PaperPanel {
                 if this
                     .update(cx, |this, cx| match result {
                         Ok(Ok(submitted)) => {
-                            this.last_submitted_documents.extend(submitted);
+                            for (path, text) in submitted {
+                                if this.in_flight_documents.get(&path) == Some(&text) {
+                                    this.in_flight_documents.remove(&path);
+                                }
+                                this.last_submitted_documents.insert(path, text);
+                            }
                         }
                         Ok(Err(error)) => {
+                            this.clear_in_flight_documents(&in_flight);
                             this.project_message = Some(format!(
                                 "Could not send an editor change to Overleaf: {error}"
                             ));
                             cx.notify();
                         }
                         Err(error) => {
+                            this.clear_in_flight_documents(&in_flight);
                             this.project_message =
                                 Some(format!("The native Overleaf edit task stopped: {error}"));
                             cx.notify();
@@ -1154,6 +1255,14 @@ impl PaperPanel {
                 }
             }
         });
+    }
+
+    fn clear_in_flight_documents(&mut self, documents: &[(String, String)]) {
+        for (path, text) in documents {
+            if self.in_flight_documents.get(path) == Some(text) {
+                self.in_flight_documents.remove(path);
+            }
+        }
     }
 
     fn schedule_presence_markers(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2010,6 +2119,7 @@ struct LocalOverleafCursor {
 struct PendingDocumentSnapshot {
     text: String,
     origin: &'static str,
+    materialization: NativeSnapshotMaterialization,
 }
 
 async fn login_with_browser() -> Result<()> {

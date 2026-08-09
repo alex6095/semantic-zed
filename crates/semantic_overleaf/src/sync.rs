@@ -162,6 +162,12 @@ pub enum NativeSyncEvent {
         path: String,
         origin: String,
         text: String,
+        /// Whether `text` has also been safely materialized at `path` on disk.
+        ///
+        /// Open Zed buffers can deliberately own newer text than their backing
+        /// file. Consumers must apply an unmaterialized update to that buffer
+        /// directly instead of asking the buffer to reload the old file.
+        materialized: bool,
     },
     PresenceChanged {
         collaborators: Vec<NativePresence>,
@@ -173,6 +179,23 @@ pub enum NativeSyncEvent {
     Error {
         message: String,
     },
+}
+
+/// Describes whether an incoming text snapshot already owns the local file.
+///
+/// An editor buffer is authoritative while it has unsaved changes. Rewriting
+/// its backing file for every live-sync snapshot makes Zed interpret its own
+/// write as an external modification and produces a save conflict. Filesystem
+/// snapshots, by contrast, were observed after the write and are safe to use
+/// as the on-disk replica state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NativeSnapshotMaterialization {
+    /// The caller supplied text from an open editor buffer. The sync engine
+    /// must not rewrite the backing file merely to send this text to Overleaf.
+    #[default]
+    EditorBuffer,
+    /// The caller observed this text in the local file system.
+    Filesystem,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -315,12 +338,46 @@ impl NativeSyncHandle {
         text: impl Into<String>,
         origin: impl Into<String>,
     ) -> Result<NativeDocumentSnapshot, NativeSyncError> {
+        self.apply_snapshot_with_materialization(
+            path,
+            text,
+            origin,
+            NativeSnapshotMaterialization::Filesystem,
+        )
+        .await
+    }
+
+    /// Sends an in-memory snapshot without rewriting the buffer's backing
+    /// file. This is the appropriate entry point for live editor edits.
+    pub async fn apply_editor_snapshot(
+        &self,
+        path: impl Into<String>,
+        text: impl Into<String>,
+        origin: impl Into<String>,
+    ) -> Result<NativeDocumentSnapshot, NativeSyncError> {
+        self.apply_snapshot_with_materialization(
+            path,
+            text,
+            origin,
+            NativeSnapshotMaterialization::EditorBuffer,
+        )
+        .await
+    }
+
+    pub async fn apply_snapshot_with_materialization(
+        &self,
+        path: impl Into<String>,
+        text: impl Into<String>,
+        origin: impl Into<String>,
+        materialization: NativeSnapshotMaterialization,
+    ) -> Result<NativeDocumentSnapshot, NativeSyncError> {
         let (sender, receiver) = oneshot::channel();
         self.commands
             .send(NativeCommand::ApplySnapshot {
                 path: path.into(),
                 text: text.into(),
                 origin: origin.into(),
+                materialization,
                 response: sender,
             })
             .map_err(|_| NativeSyncError::ActorStopped)?;
@@ -366,6 +423,7 @@ enum NativeCommand {
         path: String,
         text: String,
         origin: String,
+        materialization: NativeSnapshotMaterialization,
         response: oneshot::Sender<Result<NativeDocumentSnapshot, NativeSyncError>>,
     },
     UpdatePosition {
@@ -390,6 +448,11 @@ struct NativeDocument {
     ranges: Value,
     read_only_reason: Option<String>,
     pending: bool,
+    /// True when `local_text` is known to be represented by the backing file.
+    /// Editor snapshots can be synced before Zed saves them, so the replica
+    /// must retain that distinction until a matching filesystem snapshot
+    /// arrives.
+    local_text_materialized: bool,
 }
 
 impl NativeDocument {
@@ -578,9 +641,12 @@ impl NativeProjectSync {
                 path,
                 text,
                 origin,
+                materialization,
                 response,
             } => {
-                let result = self.apply_snapshot(&path, text, &origin).await;
+                let result = self
+                    .apply_snapshot(&path, text, &origin, materialization)
+                    .await;
                 let _ = response.send(result);
             }
             NativeCommand::UpdatePosition {
@@ -1027,6 +1093,7 @@ impl NativeProjectSync {
                 ranges: snapshot.ranges,
                 read_only_reason: snapshot.read_only_reason,
                 pending: false,
+                local_text_materialized: true,
             });
         }
         if self.path_is_conflicted(&entity.path) {
@@ -1049,6 +1116,7 @@ impl NativeProjectSync {
                 ranges: snapshot.ranges,
                 read_only_reason: snapshot.read_only_reason,
                 pending: false,
+                local_text_materialized: true,
             });
         }
         let (base_text, local_text, state) = if let Some(stored) = stored {
@@ -1111,6 +1179,7 @@ impl NativeProjectSync {
             ranges: snapshot.ranges,
             read_only_reason: snapshot.read_only_reason,
             pending: false,
+            local_text_materialized: true,
         })
     }
 
@@ -1119,6 +1188,7 @@ impl NativeProjectSync {
         path: &str,
         text: String,
         origin: &str,
+        materialization: NativeSnapshotMaterialization,
     ) -> Result<NativeDocumentSnapshot, NativeSyncError> {
         let id = self
             .model
@@ -1138,16 +1208,16 @@ impl NativeProjectSync {
                 return Err(NativeSyncError::ReadOnly(reason.clone()));
             }
             document.local_text = text;
+            document.local_text_materialized = snapshot_is_materialized(
+                materialization,
+                &self.root.join(&document.path),
+                &document.local_text,
+            )?;
             document.state = if document.local_text == document.remote_text {
                 "ready".into()
             } else {
                 "ready-dirty".into()
             };
-            atomic_write(
-                &self.root.join(&document.path),
-                document.local_text.as_bytes(),
-                0o644,
-            )?;
             self.store.upsert_document(document.record())?;
             self.store.persist()?;
         }
@@ -1161,6 +1231,7 @@ impl NativeProjectSync {
             path: document.path.clone(),
             origin: origin.into(),
             text: document.local_text.clone(),
+            materialized: document.local_text_materialized,
         });
         self.emit_status();
         Ok(snapshot)
@@ -1274,33 +1345,46 @@ impl NativeProjectSync {
                 return Err(NativeSyncError::Conflicted(document.path.clone()));
             }
         };
-        let disk = read_optional_text(&self.root.join(&document.path))?;
-        let materialized = match disk {
-            Some(current) if current != previous_local => {
-                match merge_text(&previous_local, &merged, &current) {
-                    MergeResult::Merged(text) => text,
-                    MergeResult::Conflict { reason } => {
-                        self.store.record_conflict(
-                            &document.id,
-                            &document.path,
-                            "text",
-                            &format!("concurrent-materialization-{reason}"),
-                            Some(previous_local.as_bytes()),
-                            Some(current.as_bytes()),
-                            Some(merged.as_bytes()),
-                        )?;
-                        document.state = "conflicted".into();
-                        return Err(NativeSyncError::Conflicted(document.path.clone()));
+        let (materialized, needs_materialization_write) = if document.local_text_materialized {
+            let disk = read_optional_text(&self.root.join(&document.path))?;
+            let materialized = match disk.as_deref() {
+                Some(current) if current != previous_local.as_str() => {
+                    match merge_text(&previous_local, &merged, &current) {
+                        MergeResult::Merged(text) => text,
+                        MergeResult::Conflict { reason } => {
+                            self.store.record_conflict(
+                                &document.id,
+                                &document.path,
+                                "text",
+                                &format!("concurrent-materialization-{reason}"),
+                                Some(previous_local.as_bytes()),
+                                Some(current.as_bytes()),
+                                Some(merged.as_bytes()),
+                            )?;
+                            document.state = "conflicted".into();
+                            return Err(NativeSyncError::Conflicted(document.path.clone()));
+                        }
                     }
                 }
-            }
-            _ => merged,
+                _ => merged,
+            };
+            let needs_materialization_write =
+                needs_materialization_write(disk.as_deref(), &materialized);
+            (materialized, needs_materialization_write)
+        } else {
+            // An open editor buffer owns the local text. Its file may still
+            // contain an older saved version, so treating that version as a
+            // concurrent edit would either overwrite the buffer or create a
+            // false conflict after every live Overleaf acknowledgement.
+            (merged, false)
         };
-        atomic_write(
-            &self.root.join(&document.path),
-            materialized.as_bytes(),
-            0o644,
-        )?;
+        if needs_materialization_write {
+            atomic_write(
+                &self.root.join(&document.path),
+                materialized.as_bytes(),
+                0o644,
+            )?;
+        }
         document.version = snapshot.version;
         document.ot_type = snapshot.ot_type;
         document.raw_snapshot = snapshot.raw_snapshot;
@@ -1319,6 +1403,7 @@ impl NativeProjectSync {
             path: document.path.clone(),
             origin: origin.into(),
             text: document.local_text.clone(),
+            materialized: document.local_text_materialized,
         });
         Ok(())
     }
@@ -1362,6 +1447,10 @@ impl NativeProjectSync {
                 continue;
             };
             match String::from_utf8(file.bytes.clone()) {
+                Ok(text) if !document.local_text_materialized && text == document.local_text => {
+                    documents.push((id.clone(), text))
+                }
+                Ok(_) if !document.local_text_materialized => {}
                 Ok(text) if text != document.local_text => documents.push((id.clone(), text)),
                 Ok(_) => {}
                 Err(_) => invalid_documents.push((
@@ -1391,7 +1480,13 @@ impl NativeProjectSync {
         }
         for (id, text) in documents {
             let path = self.documents[&id].path.clone();
-            self.apply_snapshot(&path, text, origin).await?;
+            self.apply_snapshot(
+                &path,
+                text,
+                origin,
+                NativeSnapshotMaterialization::Filesystem,
+            )
+            .await?;
         }
         self.sync_local_directories(&snapshot).await?;
         self.infer_local_renames(&snapshot).await?;
@@ -1687,6 +1782,7 @@ impl NativeProjectSync {
                     ranges: remote.ranges,
                     read_only_reason: remote.read_only_reason,
                     pending: false,
+                    local_text_materialized: true,
                 };
                 self.store.upsert_document(document.record())?;
                 self.documents.insert(entity.id.clone(), document);
@@ -2567,6 +2663,23 @@ fn read_optional_text(path: &Path) -> Result<Option<String>, NativeSyncError> {
     }
 }
 
+fn snapshot_is_materialized(
+    materialization: NativeSnapshotMaterialization,
+    path: &Path,
+    text: &str,
+) -> Result<bool, NativeSyncError> {
+    match materialization {
+        NativeSnapshotMaterialization::Filesystem => Ok(true),
+        NativeSnapshotMaterialization::EditorBuffer => {
+            Ok(read_optional_text(path)?.as_deref() == Some(text))
+        }
+    }
+}
+
+fn needs_materialization_write(current_disk: Option<&str>, materialized: &str) -> bool {
+    current_disk != Some(materialized)
+}
+
 fn read_optional_bytes(path: &Path) -> Result<Option<Vec<u8>>, NativeSyncError> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -2696,5 +2809,49 @@ mod tests {
         assert_eq!(presence.document_path, "main.tex");
         assert_eq!(presence.name, "Alex Lee");
         assert_eq!((presence.row, presence.column), (11, 24));
+    }
+
+    #[test]
+    fn editor_snapshots_do_not_claim_an_older_file_as_materialized() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("main.tex");
+        fs::write(&path, "saved").unwrap();
+
+        assert!(
+            !snapshot_is_materialized(
+                NativeSnapshotMaterialization::EditorBuffer,
+                &path,
+                "unsaved",
+            )
+            .unwrap()
+        );
+        assert!(
+            snapshot_is_materialized(NativeSnapshotMaterialization::EditorBuffer, &path, "saved",)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn filesystem_snapshots_are_materialized_without_rewriting_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("main.tex");
+        fs::write(&path, "from external tool").unwrap();
+
+        assert!(
+            snapshot_is_materialized(
+                NativeSnapshotMaterialization::Filesystem,
+                &path,
+                "from external tool",
+            )
+            .unwrap()
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), "from external tool");
+    }
+
+    #[test]
+    fn skips_the_atomic_write_when_authoritative_text_is_already_on_disk() {
+        assert!(!needs_materialization_write(Some("same text"), "same text"));
+        assert!(needs_materialization_write(Some("older text"), "same text"));
+        assert!(needs_materialization_write(None, "same text"));
     }
 }
