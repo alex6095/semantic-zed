@@ -119,38 +119,7 @@ pub enum SocketIoCodecError {
 }
 
 fn json_text(value: &Value) -> Result<String, SocketIoCodecError> {
-    let encoded = serde_json::to_string(value)
-        .map_err(|error| SocketIoCodecError::InvalidJson(error.to_string()))?;
-    Ok(escape_non_bmp_json(&encoded))
-}
-
-// Overleaf's production Socket.IO 0.9 endpoint still passes event payloads
-// through a legacy JavaScript JSON path which preserves BMP characters but
-// replaces raw four-byte UTF-8 scalars with one replacement character per
-// UTF-16 surrogate. JSON unicode escapes cross that boundary losslessly and
-// are decoded back into the original scalar by JSON.parse on the server.
-fn escape_non_bmp_json(encoded: &str) -> String {
-    use std::fmt::Write as _;
-
-    if !encoded.chars().any(|character| character.len_utf16() == 2) {
-        return encoded.to_owned();
-    }
-
-    let mut escaped = String::with_capacity(encoded.len());
-    for character in encoded.chars() {
-        let codepoint = character as u32;
-        if codepoint <= 0xffff {
-            escaped.push(character);
-            continue;
-        }
-
-        let surrogate = codepoint - 0x1_0000;
-        let high = 0xd800 + (surrogate >> 10);
-        let low = 0xdc00 + (surrogate & 0x3ff);
-        write!(&mut escaped, "\\u{high:04x}\\u{low:04x}")
-            .expect("writing JSON escapes into a String cannot fail");
-    }
-    escaped
+    serde_json::to_string(value).map_err(|error| SocketIoCodecError::InvalidJson(error.to_string()))
 }
 
 pub fn encode_packet(packet: &Packet) -> Result<String, SocketIoCodecError> {
@@ -367,15 +336,6 @@ mod tests {
             encoded,
             "5:4+::{\"name\":\"applyOtUpdate\",\"args\":[\"doc-1\",{\"v\":7}]}"
         );
-        assert_eq!(decode_packet(&encoded).unwrap(), packet);
-    }
-
-    #[test]
-    fn event_packet_escapes_non_bmp_json_as_surrogate_pairs() {
-        let packet = Packet::event("applyOtUpdate", vec![json!("한😀")]);
-        let encoded = encode_packet(&packet).unwrap();
-        assert!(encoded.contains("한\\ud83d\\ude00"));
-        assert!(!encoded.contains('😀'));
         assert_eq!(decode_packet(&encoded).unwrap(), packet);
     }
 

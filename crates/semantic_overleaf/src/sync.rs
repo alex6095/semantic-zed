@@ -209,6 +209,16 @@ pub enum NativeSyncError {
     Conflicted(String),
     #[error("Overleaf document is read-only: {0}")]
     ReadOnly(String),
+    #[error(
+        "Overleaf cannot store non-BMP character {character} (U+{codepoint}) at {path}:{row}:{column}; the local file is preserved. Use a BMP character or a LaTeX command instead"
+    )]
+    UnsupportedNonBmp {
+        path: String,
+        character: char,
+        codepoint: String,
+        row: usize,
+        column: usize,
+    },
     #[error("Overleaf write was acknowledged but not proven in the authoritative snapshot: {0}")]
     WriteNotProven(String),
     #[error("Cloud compile is blocked by unresolved conflicts")]
@@ -1194,6 +1204,15 @@ impl NativeProjectSync {
             document.local_text = desired;
             document.state = "ready".into();
             return Ok(());
+        }
+        if let Some((character, row, column)) = first_non_bmp_position(&desired) {
+            return Err(NativeSyncError::UnsupportedNonBmp {
+                path: document.path.clone(),
+                character,
+                codepoint: format!("{:04X}", character as u32),
+                row,
+                column,
+            });
         }
         let submitted_remote = document.remote_text.clone();
         document.pending = true;
@@ -2461,6 +2480,23 @@ fn client_id(value: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+fn first_non_bmp_position(text: &str) -> Option<(char, usize, usize)> {
+    let mut row = 1;
+    let mut column = 1;
+    for character in text.chars() {
+        if character.len_utf16() == 2 {
+            return Some((character, row, column));
+        }
+        if character == '\n' {
+            row += 1;
+            column = 1;
+        } else {
+            column += character.len_utf16();
+        }
+    }
+    None
+}
+
 fn presence_from_value(value: &Value, model: &ProjectModel) -> Option<NativePresence> {
     let client_id = client_id(value)?.to_owned();
     let cursor = value
@@ -2576,6 +2612,12 @@ mod tests {
         let config = NativeProjectConfig::load(directory.path()).unwrap();
         assert_eq!(config.project_id, "paper-1");
         assert_eq!(config.scan_interval_ms, 500);
+    }
+
+    #[test]
+    fn reports_non_bmp_positions_but_accepts_bmp_emoji_sequences() {
+        assert_eq!(first_non_bmp_position("한글\nabc😀z"), Some(('😀', 2, 4)));
+        assert_eq!(first_non_bmp_position("한글 ☺️ 좌표"), None);
     }
 
     #[test]
