@@ -128,6 +128,7 @@ pub enum IconName {
     FileCode,
     FileDiff,
     FileDoc,
+    FilePdf,
     FileGeneric,
     FileGit,
     FileIgnored,

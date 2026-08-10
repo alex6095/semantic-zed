@@ -194,7 +194,7 @@ impl Render for PdfPreviewPanel {
                                     .rounded_md()
                                     .bg(palette.accent_tint)
                                     .child(
-                                        Icon::new(IconName::FileDoc)
+                                        Icon::new(IconName::FilePdf)
                                             .size(IconSize::Small)
                                             .color(Color::Accent),
                                     ),
@@ -291,7 +291,7 @@ impl Render for PdfPreviewPanel {
                                 .justify_center()
                                 .gap_2()
                                 .child(
-                                    Icon::new(IconName::FileDoc)
+                                    Icon::new(IconName::FilePdf)
                                         .size(IconSize::XLarge)
                                         .color(Color::Muted),
                                 )
@@ -335,7 +335,7 @@ impl Panel for PdfPreviewPanel {
     }
 
     fn icon(&self, _: &Window, _: &App) -> Option<IconName> {
-        Some(IconName::FileDoc)
+        Some(IconName::FilePdf)
     }
 
     fn icon_tooltip(&self, _: &Window, _: &App) -> Option<&'static str> {
