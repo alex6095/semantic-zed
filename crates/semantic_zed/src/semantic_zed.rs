@@ -5,8 +5,8 @@ use editor::{
 };
 use gpui::{
     App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    PathPromptOptions, Role, Styled, Subscription, Task, TextStyle, WeakEntity, Window, actions,
-    prelude::*,
+    PathPromptOptions, PromptLevel, Role, Styled, Subscription, Task, TextStyle, WeakEntity,
+    Window, actions, prelude::*,
 };
 use gpui_tokio::Tokio;
 use language::{Bias, Buffer, BufferEditSource, Point, PointUtf16, Unclipped};
@@ -31,9 +31,10 @@ use std::{
 };
 use theme_settings::ThemeSettings;
 use ui::{
-    Button, ButtonStyle, Color, Icon, IconName, IconSize, Label, LabelSize, ListItem,
-    ListItemSpacing, TintColor, prelude::*,
+    Button, ButtonStyle, Color, ContextMenu, Icon, IconButton, IconName, IconSize, Label,
+    LabelSize, ListItem, ListItemSpacing, PopoverMenu, TintColor, Tooltip, prelude::*,
 };
+use unicode_segmentation::UnicodeSegmentation;
 use util::ResultExt as _;
 use workspace::{
     OpenMode, OpenOptions, Workspace,
@@ -125,6 +126,7 @@ pub struct PaperPanel {
     task: Task<()>,
     login_task: Task<()>,
     projects_task: Task<()>,
+    project_action_task: Task<()>,
     presence_task: Task<()>,
     follow_task: Task<()>,
     compile_task: Task<()>,
@@ -136,6 +138,8 @@ pub struct PaperPanel {
     projects: ProjectListState,
     initializing_project: Option<String>,
     project_message: Option<String>,
+    linked_project_id: Option<String>,
+    trashing_project_id: Option<String>,
     new_project_editor: Entity<Editor>,
     show_new_project_form: bool,
     creating_project: bool,
@@ -186,6 +190,7 @@ impl PaperPanel {
             task: Task::ready(()),
             login_task: Task::ready(()),
             projects_task: Task::ready(()),
+            project_action_task: Task::ready(()),
             presence_task: Task::ready(()),
             follow_task: Task::ready(()),
             compile_task: Task::ready(()),
@@ -197,6 +202,8 @@ impl PaperPanel {
             projects: ProjectListState::NotConnected,
             initializing_project: None,
             project_message: None,
+            linked_project_id: None,
+            trashing_project_id: None,
             new_project_editor,
             show_new_project_form: false,
             creating_project: false,
@@ -466,12 +473,17 @@ impl PaperPanel {
 
     fn refresh_current_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.paper_root.clone() else {
+            self.linked_project_id = None;
             self.status = PaperStatus::Unavailable;
             self.reset_native_sync();
             self.clear_presence(window, cx);
             cx.notify();
             return;
         };
+
+        self.linked_project_id = NativeProjectConfig::load(&root)
+            .ok()
+            .map(|config| config.project_id);
 
         self.status = PaperStatus::Loading;
         cx.notify();
@@ -560,6 +572,7 @@ impl PaperPanel {
         cx: &mut Context<Self>,
     ) {
         let is_live = status.state == "live";
+        self.linked_project_id = Some(status.project_id.clone());
         self.presence = status
             .collaborators
             .iter()
@@ -649,7 +662,10 @@ impl PaperPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.initializing_project.is_some() || remote_project.is_read_only_bucket() {
+        if self.initializing_project.is_some()
+            || remote_project.is_read_only_bucket()
+            || self.linked_project_id.as_deref() == Some(remote_project.id.as_str())
+        {
             return;
         }
         self.project_message = None;
@@ -816,6 +832,88 @@ impl PaperPanel {
                     Err(error) => {
                         this.project_message = Some(format!(
                             "Could not create {name}: {}",
+                            local_replica_error_message(&error)
+                        ));
+                        cx.notify();
+                    }
+                }
+            })
+            .log_err();
+        });
+    }
+
+    fn confirm_project_trash_action(
+        &mut self,
+        project: RemoteProject,
+        action: ProjectTrashAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.trashing_project_id.is_some() || !action.is_available_for(&project) {
+            return;
+        }
+
+        let (title, detail, confirm_label) = match action {
+            ProjectTrashAction::MoveToTrash => (
+                format!("Move {} to Trash?", project.name),
+                "This removes the project from your active Overleaf list. The local replica is preserved, and the project can be restored from Trash.",
+                "Move to Trash",
+            ),
+            ProjectTrashAction::Restore => (
+                format!("Restore {}?", project.name),
+                "This returns the project to your active Overleaf project list.",
+                "Restore",
+            ),
+        };
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            &title,
+            Some(detail),
+            &[confirm_label, "Cancel"],
+            cx,
+        );
+        let project_id = project.id.clone();
+        let project_name = project.name.clone();
+        self.project_action_task = cx.spawn_in(window, async move |this, cx| {
+            if prompt.await != Ok(0) {
+                return;
+            }
+
+            let request = this.update(cx, |this, cx| {
+                this.trashing_project_id = Some(project_id.clone());
+                this.project_message = Some(action.progress_message(&project_name));
+                cx.notify();
+                let request_project_id = project_id.clone();
+                Tokio::spawn_result(cx, async move {
+                    update_remote_project_trash_state(&request_project_id, action).await
+                })
+            });
+            let Ok(request) = request else {
+                return;
+            };
+            let result = request.await;
+            this.update_in(cx, |this, window, cx| {
+                this.trashing_project_id = None;
+                match result {
+                    Ok(()) => {
+                        this.project_message = Some(action.success_message(&project_name));
+                        if matches!(action, ProjectTrashAction::MoveToTrash)
+                            && this.linked_project_id.as_deref() == Some(project_id.as_str())
+                        {
+                            this.reset_native_sync();
+                            this.clear_presence(window, cx);
+                            this.status = PaperStatus::Error(
+                                "This linked project is in Overleaf Trash. Restore it to resume live sync."
+                                    .to_string(),
+                            );
+                        }
+                        this.refresh_projects(window, cx);
+                    }
+                    Err(error) => {
+                        this.project_message = Some(format!(
+                            "Could not {} {}: {}",
+                            action.failure_verb(),
+                            project_name,
                             local_replica_error_message(&error)
                         ));
                         cx.notify();
@@ -1509,6 +1607,43 @@ impl Render for PaperPanel {
             .as_ref()
             .map(|root| root.display().to_string())
             .unwrap_or_else(|| "No initialized Overleaf replica is open.".to_string());
+        let linked_project_id = self
+            .linked_project_id
+            .clone()
+            .or_else(|| match &self.status {
+                PaperStatus::Ready(status) if !status.project_id.is_empty() => {
+                    Some(status.project_id.clone())
+                }
+                _ => None,
+            });
+        let linked_remote_project = linked_project_id.as_deref().and_then(|project_id| {
+            self.projects
+                .projects()
+                .iter()
+                .find(|project| project.id == project_id)
+        });
+        let linked_project_name = match &self.status {
+            PaperStatus::Ready(status) => status.project_name.clone(),
+            _ => None,
+        }
+        .or_else(|| linked_remote_project.map(|project| project.name.clone()))
+        .unwrap_or_else(|| {
+            if has_root {
+                "Linked Overleaf project".to_string()
+            } else {
+                "No Overleaf project linked".to_string()
+            }
+        });
+        let linked_project_metadata = linked_project_id.as_deref().map(|project_id| {
+            let short_id = short_project_id(project_id);
+            let access = linked_remote_project
+                .map(RemoteProject::access_label)
+                .filter(|access| !access.is_empty());
+            match access {
+                Some(access) => format!("{access} · Project {short_id}"),
+                None => format!("Project {short_id}"),
+            }
+        });
 
         let connected = matches!(&self.login, LoginState::Connected);
         let project_count = self.projects.projects().len();
@@ -1523,6 +1658,13 @@ impl Render for PaperPanel {
                 .cursor;
             let target = collaborator.clone();
             let collaborator_label = collaborator.display_name();
+            let collaborator_tooltip = format!("Follow {collaborator_label}");
+            let collaborator_initial = collaborator_initial(&collaborator_label);
+            let avatar_text_color = if participant_color.l > 0.62 {
+                gpui::black()
+            } else {
+                gpui::white()
+            };
             collaborator_rows = collaborator_rows.child(
                 ListItem::new(format!(
                     "semantic-zed-collaborator-{}",
@@ -1538,13 +1680,23 @@ impl Render for PaperPanel {
                     collaborator.row + 1,
                     collaborator.column + 1,
                 ))
+                .tooltip(Tooltip::text(collaborator_tooltip))
                 .start_slot(
                     div()
+                        .flex()
                         .flex_none()
-                        .w(px(10.0))
-                        .h(px(10.0))
+                        .w(px(36.0))
+                        .h(px(36.0))
+                        .items_center()
+                        .justify_center()
                         .rounded_full()
-                        .bg(participant_color),
+                        .bg(participant_color)
+                        .child(
+                            Label::new(collaborator_initial)
+                                .size(LabelSize::Small)
+                                .weight(FontWeight::SEMIBOLD)
+                                .color(Color::Custom(avatar_text_color)),
+                        ),
                 )
                 .end_slot(Icon::new(IconName::ChevronRight).size(IconSize::XSmall))
                 .show_end_slot_on_hover()
@@ -1552,7 +1704,7 @@ impl Render for PaperPanel {
                     v_flex()
                         .min_w_0()
                         .child(
-                            Label::new(collaborator_label)
+                            Label::new(collaborator_label.clone())
                                 .size(LabelSize::XSmall)
                                 .weight(FontWeight::MEDIUM)
                                 .truncate(),
@@ -1618,16 +1770,66 @@ impl Render for PaperPanel {
                 );
                 previous_bucket = Some(project.bucket_label());
             }
+            let is_current = linked_project_id.as_deref() == Some(project.id.as_str());
             let disabled = self.initializing_project.is_some()
                 || self.creating_project
-                || project.is_read_only_bucket();
-            let status_label = project.access_label();
+                || self.trashing_project_id.is_some();
+            let status_label = if is_current {
+                "Syncing".to_string()
+            } else {
+                project.access_label()
+            };
             let updated_label = project.updated_label();
-            project_rows = project_rows.child(
+            let action_menu = project.trash_action().map(|action| {
+                let panel = cx.weak_entity();
+                let action_project = project.clone();
+                let trigger_id = format!("semantic-zed-project-actions-{}", project.id);
+                div()
+                    .id(format!(
+                        "semantic-zed-project-actions-wrapper-{}",
+                        project.id
+                    ))
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(
+                        PopoverMenu::new(format!(
+                            "semantic-zed-project-actions-menu-{}",
+                            project.id
+                        ))
+                        .trigger(
+                            IconButton::new(trigger_id, IconName::Ellipsis)
+                                .icon_size(IconSize::Small)
+                                .disabled(disabled)
+                                .tooltip(Tooltip::text("Project actions")),
+                        )
+                        .menu(move |window, cx| {
+                            let panel = panel.clone();
+                            let action_project = action_project.clone();
+                            Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                                let panel = panel.clone();
+                                let action_project = action_project.clone();
+                                menu.entry(action.label(), None, move |window, cx| {
+                                    panel
+                                        .update(cx, |this, cx| {
+                                            this.confirm_project_trash_action(
+                                                action_project.clone(),
+                                                action,
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                        .ok();
+                                })
+                            }))
+                        }),
+                    )
+                    .into_any_element()
+            });
+            let mut project_row =
                 ListItem::new(format!("semantic-zed-project-{}", project.id))
                     .spacing(ListItemSpacing::Dense)
                     .rounded()
                     .disabled(disabled)
+                    .toggle_state(is_current)
                     .start_slot(
                         Icon::new(if project.is_read_only_bucket() {
                             IconName::Archive
@@ -1641,11 +1843,13 @@ impl Render for PaperPanel {
                             Color::Accent
                         }),
                     )
-                    .end_slot(
-                        Label::new(status_label)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
+                    .end_slot(Label::new(status_label).size(LabelSize::XSmall).color(
+                        if is_current {
+                            Color::Accent
+                        } else {
+                            Color::Muted
+                        },
+                    ))
                     .child(
                         v_flex()
                             .min_w_0()
@@ -1667,8 +1871,11 @@ impl Render for PaperPanel {
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.choose_local_replica(project.clone(), window, cx);
-                    })),
-            );
+                    }));
+            if let Some(action_menu) = action_menu {
+                project_row = project_row.end_slot_on_hover(action_menu);
+            }
+            project_rows = project_rows.child(project_row);
         }
 
         v_flex()
@@ -1729,6 +1936,7 @@ impl Render for PaperPanel {
             )
             .child(
                 v_flex()
+                    .min_w_0()
                     .gap_2()
                     .p_3()
                     .bg(palette.card)
@@ -1829,20 +2037,76 @@ impl Render for PaperPanel {
                     .rounded_lg()
                     .shadow(palette.card_shadow)
                     .child(
-                        Label::new("Current replica")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                Label::new("Current project")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_none()
+                                    .gap_1()
+                                    .child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(
+                                        if self.status.is_live() {
+                                            cx.theme().status().success
+                                        } else {
+                                            cx.theme().colors().text_muted
+                                        },
+                                    ))
+                                    .child(
+                                        Label::new(if self.status.is_live() {
+                                            "Live"
+                                        } else {
+                                            "Not live"
+                                        })
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                    ),
+                            ),
                     )
+                    .child(
+                        Label::new(linked_project_name)
+                            .size(LabelSize::Small)
+                            .weight(FontWeight::SEMIBOLD)
+                            .truncate(),
+                    )
+                    .when_some(linked_project_metadata, |this, metadata| {
+                        this.child(
+                            Label::new(metadata)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .truncate(),
+                        )
+                    })
                     .child(
                         Label::new(status_text)
-                            .size(LabelSize::Small)
-                            .weight(FontWeight::MEDIUM),
-                    )
-                    .child(
-                        Label::new(root_text)
                             .size(LabelSize::XSmall)
                             .color(Color::Muted)
                             .truncate(),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .gap_0p5()
+                            .pt_1()
+                            .border_t_1()
+                            .border_color(palette.divider)
+                            .child(
+                                Label::new("Local folder")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(root_text)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            ),
                     )
                     .when(presence_count > 0, |this| {
                         this.child(
@@ -1870,6 +2134,7 @@ impl Render for PaperPanel {
                     })
                     .child(
                         h_flex()
+                            .flex_wrap()
                             .gap_1()
                             .child(
                                 Button::new("semantic-zed-start-sync", "Start sync")
@@ -2071,6 +2336,61 @@ impl RemoteProject {
             .and_then(|timestamp| timestamp.get(..10))
             .map(|date| format!("Updated {date}"))
     }
+
+    fn trash_action(&self) -> Option<ProjectTrashAction> {
+        if self.trashed {
+            Some(ProjectTrashAction::Restore)
+        } else if !self.archived {
+            Some(ProjectTrashAction::MoveToTrash)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectTrashAction {
+    MoveToTrash,
+    Restore,
+}
+
+impl ProjectTrashAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::MoveToTrash => "Move to Trash…",
+            Self::Restore => "Restore",
+        }
+    }
+
+    fn is_available_for(self, project: &RemoteProject) -> bool {
+        match self {
+            Self::MoveToTrash => !project.archived && !project.trashed,
+            Self::Restore => project.trashed,
+        }
+    }
+
+    fn progress_message(self, project_name: &str) -> String {
+        match self {
+            Self::MoveToTrash => format!("Moving {project_name} to Overleaf Trash…"),
+            Self::Restore => format!("Restoring {project_name} from Overleaf Trash…"),
+        }
+    }
+
+    fn success_message(self, project_name: &str) -> String {
+        match self {
+            Self::MoveToTrash => {
+                format!("Moved {project_name} to Overleaf Trash. Its local replica was preserved.")
+            }
+            Self::Restore => format!("Restored {project_name} from Overleaf Trash."),
+        }
+    }
+
+    fn failure_verb(self) -> &'static str {
+        match self {
+            Self::MoveToTrash => "move to Trash",
+            Self::Restore => "restore",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2154,6 +2474,7 @@ impl PaperStatus {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct DaemonStatus {
     state: String,
+    project_id: String,
     project_name: Option<String>,
     pending: usize,
     conflicts: Vec<String>,
@@ -2171,6 +2492,7 @@ impl DaemonStatus {
 
         Self {
             state: status.state.clone(),
+            project_id: status.project_id.clone(),
             project_name: status.project_name.clone(),
             pending: status.documents.pending,
             conflicts: status
@@ -2332,6 +2654,19 @@ async fn list_remote_projects() -> Result<Vec<RemoteProject>> {
 async fn create_remote_project(name: &str) -> Result<()> {
     let (mut client, saved_identity) = native_http_client().await?;
     client.create_project(name, "none").await?;
+    persist_rotated_identity(&client, &saved_identity)?;
+    Ok(())
+}
+
+async fn update_remote_project_trash_state(
+    project_id: &str,
+    action: ProjectTrashAction,
+) -> Result<()> {
+    let (mut client, saved_identity) = native_http_client().await?;
+    match action {
+        ProjectTrashAction::MoveToTrash => client.trash_project(project_id).await?,
+        ProjectTrashAction::Restore => client.untrash_project(project_id).await?,
+    }
     persist_rotated_identity(&client, &saved_identity)?;
     Ok(())
 }
@@ -2533,6 +2868,29 @@ fn presence_participant_index(client_id: &str) -> u32 {
     })
 }
 
+fn collaborator_initial(name: &str) -> String {
+    name.trim()
+        .graphemes(true)
+        .find(|grapheme| grapheme.chars().any(char::is_alphanumeric))
+        .or_else(|| name.trim().graphemes(true).next())
+        .map(|grapheme| grapheme.to_uppercase())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn short_project_id(project_id: &str) -> String {
+    let characters = project_id.chars().collect::<Vec<_>>();
+    if characters.len() <= 14 {
+        return project_id.to_string();
+    }
+    format!(
+        "{}…{}",
+        characters[..8].iter().collect::<String>(),
+        characters[characters.len() - 4..]
+            .iter()
+            .collect::<String>()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2542,6 +2900,7 @@ mod tests {
     fn reports_each_safety_relevant_connection_state() {
         let live = DaemonStatus {
             state: "live".to_string(),
+            project_id: "paper-1".to_string(),
             project_name: None,
             pending: 0,
             conflicts: Vec::new(),
@@ -2606,6 +2965,46 @@ mod tests {
         };
         assert_eq!(trashed.bucket_label(), "Trash");
         assert!(trashed.is_read_only_bucket());
+    }
+
+    #[test]
+    fn exposes_only_recoverable_project_trash_actions() {
+        let active = RemoteProject {
+            id: "active".to_string(),
+            name: "Active paper".to_string(),
+            access_level: "readWrite".to_string(),
+            last_updated: None,
+            archived: false,
+            trashed: false,
+        };
+        assert_eq!(active.trash_action(), Some(ProjectTrashAction::MoveToTrash));
+
+        let archived = RemoteProject {
+            archived: true,
+            ..active.clone()
+        };
+        assert_eq!(archived.trash_action(), None);
+
+        let trashed = RemoteProject {
+            trashed: true,
+            ..active
+        };
+        assert_eq!(trashed.trash_action(), Some(ProjectTrashAction::Restore));
+    }
+
+    #[test]
+    fn renders_unicode_safe_collaborator_initials_and_project_ids() {
+        assert_eq!(collaborator_initial("Alex Lee"), "A");
+        assert_eq!(collaborator_initial(" 나영주"), "나");
+        assert_eq!(collaborator_initial("👩🏽‍💻 Researcher"), "R");
+        assert_eq!(collaborator_initial("✨"), "✨");
+        assert_eq!(collaborator_initial("  "), "?");
+
+        assert_eq!(short_project_id("paper-1"), "paper-1");
+        assert_eq!(
+            short_project_id("6a78e74ad29d6694dc52f58a"),
+            "6a78e74a…f58a"
+        );
     }
 
     #[test]
