@@ -1824,54 +1824,57 @@ impl Render for PaperPanel {
                     )
                     .into_any_element()
             });
-            let mut project_row =
-                ListItem::new(format!("semantic-zed-project-{}", project.id))
-                    .spacing(ListItemSpacing::Dense)
-                    .rounded()
-                    .disabled(disabled)
-                    .toggle_state(is_current)
-                    .start_slot(
-                        Icon::new(if project.is_read_only_bucket() {
-                            IconName::Archive
-                        } else {
-                            IconName::FileDoc
-                        })
-                        .size(IconSize::Small)
-                        .color(if project.is_read_only_bucket() {
-                            Color::Muted
-                        } else {
-                            Color::Accent
-                        }),
-                    )
-                    .end_slot(Label::new(status_label).size(LabelSize::XSmall).color(
-                        if is_current {
-                            Color::Accent
-                        } else {
-                            Color::Muted
-                        },
-                    ))
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .gap_0p5()
-                            .child(
-                                Label::new(project.name.clone())
-                                    .size(LabelSize::Small)
-                                    .weight(FontWeight::MEDIUM)
+            let mut project_row = ListItem::new(format!("semantic-zed-project-{}", project.id))
+                .spacing(ListItemSpacing::Dense)
+                .rounded()
+                .disabled(disabled)
+                .toggle_state(is_current)
+                .start_slot(
+                    Icon::new(if project.is_read_only_bucket() {
+                        IconName::Archive
+                    } else {
+                        IconName::FileDoc
+                    })
+                    .size(IconSize::Small)
+                    .color(if project.is_read_only_bucket() {
+                        Color::Muted
+                    } else {
+                        Color::Accent
+                    }),
+                )
+                .end_slot(
+                    h_flex().flex_none().child(
+                        Label::new(status_label)
+                            .size(LabelSize::XSmall)
+                            .color(if is_current {
+                                Color::Accent
+                            } else {
+                                Color::Muted
+                            }),
+                    ),
+                )
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .gap_0p5()
+                        .child(
+                            Label::new(project.name.clone())
+                                .size(LabelSize::Small)
+                                .weight(FontWeight::MEDIUM)
+                                .truncate(),
+                        )
+                        .when_some(updated_label, |this, updated_label| {
+                            this.child(
+                                Label::new(updated_label)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
                                     .truncate(),
                             )
-                            .when_some(updated_label, |this, updated_label| {
-                                this.child(
-                                    Label::new(updated_label)
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted)
-                                        .truncate(),
-                                )
-                            }),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.choose_local_replica(project.clone(), window, cx);
-                    }));
+                        }),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.choose_local_replica(project.clone(), window, cx);
+                }));
             if let Some(action_menu) = action_menu {
                 project_row = project_row.end_slot_on_hover(action_menu);
             }
