@@ -229,6 +229,26 @@ impl OverleafHttpClient {
             })
     }
 
+    pub async fn trash_project(&mut self, project_id: &str) -> Result<(), HttpError> {
+        let project_id = validated_project_id(project_id)?;
+        let route = format!("project/{project_id}/trash");
+        let response = self
+            .request(Method::POST, &route, None, true, REQUEST_TIMEOUT)
+            .await?;
+        self.require_success(Method::POST, &route, response)?;
+        Ok(())
+    }
+
+    pub async fn untrash_project(&mut self, project_id: &str) -> Result<(), HttpError> {
+        let project_id = validated_project_id(project_id)?;
+        let route = format!("project/{project_id}/trash");
+        let response = self
+            .request(Method::DELETE, &route, None, true, REQUEST_TIMEOUT)
+            .await?;
+        self.require_success(Method::DELETE, &route, response)?;
+        Ok(())
+    }
+
     pub async fn get_project_entities(
         &mut self,
         project_id: &str,
@@ -991,6 +1011,21 @@ fn path_segment(value: &str) -> String {
     utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
 }
 
+fn validated_project_id(project_id: &str) -> Result<String, HttpError> {
+    if project_id.trim().is_empty()
+        || project_id != project_id.trim()
+        || project_id
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        || project_id.contains(['/', '\\', '?', '#'])
+    {
+        return Err(HttpError::InvalidResponse(
+            "project id must be a non-empty route segment".into(),
+        ));
+    }
+    Ok(path_segment(project_id))
+}
+
 fn parse_content_range(value: &str) -> Option<(usize, usize, Option<usize>)> {
     let value = value.strip_prefix("bytes ")?;
     let (range, total) = value.split_once('/')?;
@@ -1198,6 +1233,103 @@ mod tests {
         assert_eq!(value["projectName"], "A new paper");
         assert_eq!(value["template"], "none");
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn trash_and_untrash_projects_use_recoverable_dashboard_routes() {
+        let project_id = "66abc0da96a34861ab376243";
+        let (url, requests, server) = mock_server(vec![
+            MockResponse {
+                status: 200,
+                headers: vec![],
+                body: b"",
+            },
+            MockResponse {
+                status: 204,
+                headers: vec![],
+                body: b"",
+            },
+        ]);
+        let mut client = OverleafHttpClient::new(&url).unwrap();
+        client.set_identity(identity());
+
+        client.trash_project(project_id).await.unwrap();
+        client.untrash_project(project_id).await.unwrap();
+
+        let trash_request = requests.recv().unwrap();
+        assert!(
+            trash_request.starts_with(&format!("POST /project/{project_id}/trash HTTP/1.1")),
+            "{trash_request}"
+        );
+        assert!(
+            trash_request
+                .to_ascii_lowercase()
+                .contains("cookie: session=x\r\n")
+        );
+        assert!(
+            trash_request
+                .to_ascii_lowercase()
+                .contains("x-csrf-token: csrf\r\n")
+        );
+
+        let untrash_request = requests.recv().unwrap();
+        assert!(
+            untrash_request.starts_with(&format!("DELETE /project/{project_id}/trash HTTP/1.1")),
+            "{untrash_request}"
+        );
+        assert!(
+            untrash_request
+                .to_ascii_lowercase()
+                .contains("x-csrf-token: csrf\r\n")
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn trash_project_surfaces_server_failure() {
+        let project_id = "66abc0da96a34861ab376243";
+        let expected_route = format!("project/{project_id}/trash");
+        let (url, _requests, server) = mock_server(vec![MockResponse {
+            status: 500,
+            headers: vec![],
+            body: b"trash unavailable",
+        }]);
+        let mut client = OverleafHttpClient::new(&url).unwrap();
+        client.set_identity(identity());
+
+        let error = client.trash_project(project_id).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                HttpError::Status {
+                    method: Method::POST,
+                    ref route,
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    ref body,
+                } if route == &expected_route && body == "trash unavailable"
+            ),
+            "{error:?}"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn trash_project_rejects_blank_or_unsafe_project_ids_before_request() {
+        let mut client = OverleafHttpClient::new("http://127.0.0.1:9/").unwrap();
+        client.set_identity(identity());
+
+        for project_id in [
+            "",
+            "  ",
+            "paper/id",
+            "../paper",
+            "paper?copy",
+            " paper",
+            "paper\0id",
+        ] {
+            let error = client.trash_project(project_id).await.unwrap_err();
+            assert!(matches!(error, HttpError::InvalidResponse(_)));
+        }
     }
 
     #[tokio::test]
