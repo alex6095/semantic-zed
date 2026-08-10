@@ -1,11 +1,11 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 use editor::{
     Editor, EditorElement, EditorEvent, EditorStyle, NavigationOverlayKey, NavigationOverlayLabel,
-    NavigationTargetOverlay,
+    NavigationTargetOverlay, SelectionEffects, scroll::Autoscroll,
 };
 use gpui::{
     App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    PathPromptOptions, Styled, Subscription, Task, TextStyle, WeakEntity, Window, actions,
+    PathPromptOptions, Role, Styled, Subscription, Task, TextStyle, WeakEntity, Window, actions,
     prelude::*,
 };
 use gpui_tokio::Tokio;
@@ -26,7 +26,7 @@ use settings::Settings as _;
 use std::{
     collections::HashMap,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::{Duration, Instant},
 };
 use theme_settings::ThemeSettings;
@@ -36,7 +36,7 @@ use ui::{
 };
 use util::ResultExt as _;
 use workspace::{
-    OpenMode, Workspace,
+    OpenMode, OpenOptions, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
 
@@ -126,6 +126,7 @@ pub struct PaperPanel {
     login_task: Task<()>,
     projects_task: Task<()>,
     presence_task: Task<()>,
+    follow_task: Task<()>,
     compile_task: Task<()>,
     save_compile_task: Task<()>,
     saved_document_task: Task<()>,
@@ -186,6 +187,7 @@ impl PaperPanel {
             login_task: Task::ready(()),
             projects_task: Task::ready(()),
             presence_task: Task::ready(()),
+            follow_task: Task::ready(()),
             compile_task: Task::ready(()),
             save_compile_task: Task::ready(()),
             saved_document_task: Task::ready(()),
@@ -1321,6 +1323,85 @@ impl PaperPanel {
         });
     }
 
+    /// Follows a collaborator's latest published cursor. The remote position is
+    /// UTF-16, just like the marker overlay, so resolve it only after the
+    /// destination editor has loaded its current buffer snapshot.
+    fn follow_collaborator(
+        &mut self,
+        collaborator: OverleafPresence,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.paper_root.as_deref() else {
+            return;
+        };
+        let Some(path) = replica_document_path(root, &collaborator.document_path) else {
+            self.project_message = Some(format!(
+                "{}'s current file is not available in this replica.",
+                collaborator.display_name()
+            ));
+            cx.notify();
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let open_task = workspace.update(cx, |workspace, cx| {
+            workspace.open_abs_path(
+                path,
+                OpenOptions {
+                    focus: Some(true),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            )
+        });
+        self.follow_task = cx.spawn_in(window, async move |this, cx| {
+            let item = match open_task.await {
+                Ok(item) => item,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.project_message = Some(format!(
+                            "Could not open {}: {error}",
+                            collaborator.document_path
+                        ));
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            let Some(editor) = item.downcast::<Editor>() else {
+                return;
+            };
+            let point = PointUtf16::new(collaborator.row, collaborator.column);
+            if editor
+                .update_in(cx, |editor, window, cx| {
+                    let snapshot = editor.buffer().read(cx).snapshot(cx);
+                    let point = snapshot.point_utf16_to_point(
+                        snapshot.clip_point_utf16(Unclipped(point), Bias::Left),
+                    );
+                    editor.change_selections(
+                        SelectionEffects::scroll(Autoscroll::center()),
+                        window,
+                        cx,
+                        |selections| selections.select_ranges([point..point]),
+                    );
+                })
+                .is_err()
+            {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                this.project_message = None;
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
     fn status_text(&self) -> String {
         self.status.summary()
     }
@@ -1432,7 +1513,7 @@ impl Render for PaperPanel {
         let connected = matches!(&self.login, LoginState::Connected);
         let project_count = self.projects.projects().len();
         let presence_count = self.presence.len();
-        let mut collaborator_rows = v_flex().gap_1();
+        let mut collaborator_rows = v_flex().gap_0p5();
         for collaborator in &self.presence {
             let participant_index = presence_participant_index(&collaborator.client_id);
             let participant_color = cx
@@ -1440,39 +1521,57 @@ impl Render for PaperPanel {
                 .players()
                 .color_for_participant(participant_index)
                 .cursor;
+            let target = collaborator.clone();
+            let collaborator_label = collaborator.display_name();
             collaborator_rows = collaborator_rows.child(
-                h_flex()
-                    .gap_2()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(10.0))
-                            .h(px(10.0))
-                            .rounded_full()
-                            .bg(participant_color),
-                    )
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .child(
-                                Label::new(collaborator.display_name())
-                                    .size(LabelSize::XSmall)
-                                    .weight(FontWeight::MEDIUM)
-                                    .truncate(),
-                            )
-                            .child(
-                                Label::new(format!(
-                                    "{} · {}:{}",
-                                    collaborator.document_path,
-                                    collaborator.row + 1,
-                                    collaborator.column + 1
-                                ))
+                ListItem::new(format!(
+                    "semantic-zed-collaborator-{}",
+                    collaborator.client_id
+                ))
+                .spacing(ListItemSpacing::Dense)
+                .rounded()
+                .aria_role(Role::Button)
+                .aria_label(format!(
+                    "Go to {} at {} line {}, column {}",
+                    collaborator_label,
+                    collaborator.document_path,
+                    collaborator.row + 1,
+                    collaborator.column + 1,
+                ))
+                .start_slot(
+                    div()
+                        .flex_none()
+                        .w(px(10.0))
+                        .h(px(10.0))
+                        .rounded_full()
+                        .bg(participant_color),
+                )
+                .end_slot(Icon::new(IconName::ChevronRight).size(IconSize::XSmall))
+                .show_end_slot_on_hover()
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .child(
+                            Label::new(collaborator_label)
                                 .size(LabelSize::XSmall)
-                                .color(Color::Muted)
+                                .weight(FontWeight::MEDIUM)
                                 .truncate(),
-                            ),
-                    ),
+                        )
+                        .child(
+                            Label::new(format!(
+                                "{} · {}:{}",
+                                collaborator.document_path,
+                                collaborator.row + 1,
+                                collaborator.column + 1
+                            ))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate(),
+                        ),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.follow_collaborator(target.clone(), window, cx);
+                })),
             );
         }
         let mut project_rows = v_flex().id("semantic-zed-project-list").gap_0p5();
@@ -2373,6 +2472,27 @@ fn buffer_relative_path(buffer: &Entity<Buffer>, root: &Path, cx: &App) -> Optio
         .filter(|path| !path.is_empty())
 }
 
+/// Resolves a server-provided document path only when it stays inside the
+/// linked replica and materialized as a regular file. `OverleafPresence` also
+/// validates its slash-separated form, while this component check keeps the
+/// navigation path safe on Windows as well.
+fn replica_document_path(root: &Path, document_path: &str) -> Option<PathBuf> {
+    let relative = Path::new(document_path);
+    if document_path.is_empty()
+        || !relative.is_relative()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    let path = root.join(relative);
+    path.is_file().then_some(path)
+}
+
 fn open_document_snapshots(
     project: &Entity<Project>,
     root: &Path,
@@ -2546,6 +2666,23 @@ mod tests {
             }
         });
         assert!(!escaping.is_valid());
+    }
+
+    #[test]
+    fn resolves_collaborator_navigation_only_inside_materialized_replica_files() {
+        let replica = TempDir::new().expect("create replica root");
+        let sections = replica.path().join("sections");
+        fs::create_dir_all(&sections).expect("create section directory");
+        let document = sections.join("results.tex");
+        fs::write(&document, "\\section{Results}\n").expect("write replica document");
+
+        assert_eq!(
+            replica_document_path(replica.path(), "sections/results.tex"),
+            Some(document)
+        );
+        assert!(replica_document_path(replica.path(), "sections/missing.tex").is_none());
+        assert!(replica_document_path(replica.path(), "../outside.tex").is_none());
+        assert!(replica_document_path(replica.path(), "/tmp/outside.tex").is_none());
     }
 
     #[test]
