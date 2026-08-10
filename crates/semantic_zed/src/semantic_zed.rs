@@ -1775,7 +1775,7 @@ impl Render for PaperPanel {
                 || self.creating_project
                 || self.trashing_project_id.is_some();
             let status_label = if is_current {
-                "Syncing".to_string()
+                "Live".to_string()
             } else {
                 project.access_label()
             };
