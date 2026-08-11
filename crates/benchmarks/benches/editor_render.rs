@@ -1,6 +1,6 @@
 use editor::{
     Editor, EditorMode, MultiBuffer,
-    actions::{DeleteToPreviousWordStart, SelectAll, SplitSelectionIntoLines},
+    actions::{DeleteToPreviousWordStart, MoveLeft, MoveRight, SelectAll, SplitSelectionIntoLines},
 };
 use gpui::{AppContext as _, BenchAppContext, Focusable as _};
 use rand::{Rng as _, SeedableRng as _, rngs::StdRng};
@@ -61,6 +61,91 @@ fn editor_multi_cursor_input(line_count: &usize, cx: &mut BenchAppContext) {
                 );
             });
         })
+    });
+}
+
+#[gpui::bench(
+    inputs = multi_cursor_line_counts(),
+    group = "Multi-cursor movement",
+    input_name = "cursors",
+    sample_size = 10
+)]
+fn editor_multi_cursor_movement(line_count: &usize, cx: &mut BenchAppContext) {
+    init_context(cx);
+
+    let text = "line: xxxx\n".repeat(*line_count);
+    let buffer = cx.update(|cx| MultiBuffer::build_simple(&text, cx));
+
+    let mut window = cx.add_empty_window();
+    let editor = window.update(|window, cx| {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::new(EditorMode::full(), buffer, None, window, cx);
+            editor.set_style(editor::EditorStyle::default(), window, cx);
+            editor.select_all(&SelectAll, window, cx);
+            editor.split_selection_into_lines(
+                &SplitSelectionIntoLines {
+                    keep_selections: true,
+                },
+                window,
+                cx,
+            );
+            editor
+        });
+        window.focus(&editor.focus_handle(cx), cx);
+        editor
+    });
+
+    cx.bench_iter(|_| {
+        window.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.move_left(&MoveLeft, window, cx);
+                editor.move_left(&MoveLeft, window, cx);
+                editor.move_right(&MoveRight, window, cx);
+                editor.move_right(&MoveRight, window, cx);
+            });
+        })
+    });
+}
+
+#[gpui::bench(
+    inputs = multi_cursor_line_counts(),
+    group = "Multi-cursor render",
+    input_name = "cursors",
+    sample_size = 10
+)]
+fn editor_multi_cursor_render(line_count: &usize, cx: &mut BenchAppContext) {
+    init_context(cx);
+
+    let text = "line: xxxx\n".repeat(*line_count);
+    let buffer = cx.update(|cx| MultiBuffer::build_simple(&text, cx));
+
+    let mut window = cx.add_empty_window();
+    let editor = window.update(|window, cx| {
+        let editor = window.replace_root(cx, |window, cx| {
+            let mut editor = Editor::new(EditorMode::full(), buffer, None, window, cx);
+            editor.set_style(editor::EditorStyle::default(), window, cx);
+            editor.select_all(&SelectAll, window, cx);
+            editor.split_selection_into_lines(
+                &SplitSelectionIntoLines {
+                    keep_selections: true,
+                },
+                window,
+                cx,
+            );
+            editor
+        });
+        window.focus(&editor.focus_handle(cx), cx);
+        editor
+    });
+
+    let mut move_left = true;
+    cx.bench_renderer(editor, move |editor, window, cx| {
+        if move_left {
+            editor.move_left(&MoveLeft, window, cx);
+        } else {
+            editor.move_right(&MoveRight, window, cx);
+        }
+        move_left = !move_left;
     });
 }
 
@@ -145,6 +230,8 @@ fn multi_cursor_line_counts() -> Vec<usize> {
 gpui::bench_group!(
     benches,
     editor_multi_cursor_input,
+    editor_multi_cursor_movement,
+    editor_multi_cursor_render,
     open_editor_with_one_long_line,
     editor_render
 );
