@@ -4,9 +4,9 @@ use editor::{
     NavigationTargetOverlay, SelectionEffects, scroll::Autoscroll,
 };
 use gpui::{
-    App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    PathPromptOptions, PromptLevel, Role, Styled, Subscription, Task, TextStyle, WeakEntity,
-    Window, actions, prelude::*,
+    Anchor, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, PathPromptOptions, PromptLevel, Role, Styled, Subscription, Task, TextStyle,
+    WeakEntity, Window, actions, prelude::*,
 };
 use gpui_tokio::Tokio;
 use language::{Bias, Buffer, BufferEditSource, Point, PointUtf16, Unclipped};
@@ -31,8 +31,8 @@ use std::{
 };
 use theme_settings::ThemeSettings;
 use ui::{
-    Button, ButtonStyle, Color, ContextMenu, Icon, IconButton, IconName, IconSize, Label,
-    LabelSize, ListItem, ListItemSpacing, PopoverMenu, TintColor, Tooltip, prelude::*,
+    Button, ButtonStyle, Color, ContextMenu, CopyButton, Icon, IconButton, IconName, IconSize,
+    Label, LabelSize, ListItem, ListItemSpacing, PopoverMenu, TintColor, Tooltip, prelude::*,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use util::ResultExt as _;
@@ -123,6 +123,7 @@ pub struct PaperPanel {
     paper_root: Option<PathBuf>,
     status: PaperStatus,
     login: LoginState,
+    account_email: Option<String>,
     task: Task<()>,
     login_task: Task<()>,
     projects_task: Task<()>,
@@ -187,6 +188,7 @@ impl PaperPanel {
             paper_root: None,
             status: PaperStatus::Unavailable,
             login: LoginState::Checking,
+            account_email: None,
             task: Task::ready(()),
             login_task: Task::ready(()),
             projects_task: Task::ready(()),
@@ -614,7 +616,16 @@ impl PaperPanel {
         self.login_task = cx.spawn_in(window, async move |this, cx| {
             let login = login_task.await;
             this.update_in(cx, |this, window, cx| {
-                this.login = LoginState::from_result(login);
+                match login {
+                    Ok(identity) => {
+                        this.account_email = account_email(&identity);
+                        this.login = LoginState::Connected;
+                    }
+                    Err(_) => {
+                        this.account_email = None;
+                        this.login = LoginState::Failed;
+                    }
+                }
                 if matches!(&this.login, LoginState::Connected) {
                     this.refresh_projects(window, cx);
                 }
@@ -631,11 +642,24 @@ impl PaperPanel {
     fn refresh_login_from_credentials(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.login = LoginState::Checking;
         cx.notify();
-        let status_task = cx.background_spawn(async move { saved_login_exists() });
+        let status_task = cx.background_spawn(async move { load_saved_identity() });
         self.login_task = cx.spawn_in(window, async move |this, cx| {
             let status = status_task.await;
             this.update_in(cx, |this, window, cx| {
-                this.login = LoginState::from_saved_status(status);
+                match status {
+                    Ok(Some(identity)) => {
+                        this.account_email = account_email(&identity);
+                        this.login = LoginState::Connected;
+                    }
+                    Ok(None) => {
+                        this.account_email = None;
+                        this.login = LoginState::NotConnected;
+                    }
+                    Err(_) => {
+                        this.account_email = None;
+                        this.login = LoginState::Failed;
+                    }
+                }
                 if matches!(&this.login, LoginState::Connected) {
                     this.refresh_projects(window, cx);
                 }
@@ -644,6 +668,46 @@ impl PaperPanel {
                 } else {
                     cx.notify();
                 }
+            })
+            .log_err();
+        });
+    }
+
+    fn disconnect_overleaf(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.login.is_in_progress() {
+            return;
+        }
+
+        // Disconnect the native actor before removing its credentials. The
+        // app-owned browser profile is intentionally retained so a later
+        // reconnect can reuse the user's existing SSO session.
+        self.login_task = Task::ready(());
+        self.projects_task = Task::ready(());
+        self.project_action_task = Task::ready(());
+        self.reset_native_sync();
+        self.clear_presence(window, cx);
+        self.account_email = None;
+        self.login = LoginState::Checking;
+        self.projects = ProjectListState::NotConnected;
+        self.status = PaperStatus::Unavailable;
+        self.project_message = None;
+        cx.notify();
+
+        let disconnect_task = cx.background_spawn(async move { remove_saved_login() });
+        self.login_task = cx.spawn_in(window, async move |this, cx| {
+            let result = disconnect_task.await;
+            this.update_in(cx, |this, _, cx| {
+                this.login = if result.is_ok() {
+                    LoginState::NotConnected
+                } else {
+                    LoginState::Failed
+                };
+                if let Err(error) = result {
+                    this.project_message = Some(format!(
+                        "Could not disconnect this Overleaf account: {error}"
+                    ));
+                }
+                cx.notify();
             })
             .log_err();
         });
@@ -1519,10 +1583,6 @@ impl PaperPanel {
         });
     }
 
-    fn status_text(&self) -> String {
-        self.status.summary()
-    }
-
     fn render_new_project_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = ScientificPalette::resolve(cx);
         let settings = ThemeSettings::get_global(cx);
@@ -1618,9 +1678,6 @@ impl Render for PaperPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = ScientificPalette::resolve(cx);
         let has_root = self.paper_root.is_some();
-        let status_text = self.status_text();
-        let login_text = self.login.summary();
-        let login_button_label = self.login.button_label();
         let root_text = self
             .paper_root
             .as_ref()
@@ -1653,18 +1710,63 @@ impl Render for PaperPanel {
                 "No Overleaf project linked".to_string()
             }
         });
-        let linked_project_metadata = linked_project_id.as_deref().map(|project_id| {
-            let short_id = short_project_id(project_id);
-            let access = linked_remote_project
-                .map(RemoteProject::access_label)
-                .filter(|access| !access.is_empty());
-            match access {
-                Some(access) => format!("{access} · Project {short_id}"),
-                None => format!("Project {short_id}"),
-            }
-        });
+        let current_status_detail = (!self.status.is_live()).then(|| self.status.summary());
 
         let connected = matches!(&self.login, LoginState::Connected);
+        let account_label = self
+            .account_email
+            .clone()
+            .unwrap_or_else(|| "Overleaf account".to_string());
+        let account_tooltip = if connected {
+            format!("{account_label} · Connected")
+        } else {
+            "Connect an Overleaf account".to_string()
+        };
+        let account_menu_header = account_label.clone();
+        let account_action_label = self.login.account_action_label();
+        let account_panel = cx.weak_entity();
+        let account_menu = PopoverMenu::new("semantic-zed-account-menu")
+            .trigger_with_tooltip(
+                IconButton::new("semantic-zed-account-menu-trigger", IconName::Person)
+                    .icon_size(IconSize::Small)
+                    .style(ButtonStyle::Subtle)
+                    .disabled(self.login.is_in_progress()),
+                Tooltip::text(account_tooltip),
+            )
+            .anchor(Anchor::TopRight)
+            .menu(move |window, cx| {
+                let account_panel = account_panel.clone();
+                let account_menu_header = account_menu_header.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let login_panel = account_panel.clone();
+                    let mut menu = menu.header(account_menu_header.clone()).entry(
+                        account_action_label,
+                        None,
+                        move |window, cx| {
+                            login_panel
+                                .update(cx, |this, cx| {
+                                    this.login_to_overleaf(window, cx);
+                                })
+                                .ok();
+                        },
+                    );
+                    if connected {
+                        let disconnect_panel = account_panel.clone();
+                        menu = menu.separator().entry(
+                            "Disconnect this device",
+                            None,
+                            move |window, cx| {
+                                disconnect_panel
+                                    .update(cx, |this, cx| {
+                                        this.disconnect_overleaf(window, cx);
+                                    })
+                                    .ok();
+                            },
+                        );
+                    }
+                    menu
+                }))
+            });
         let project_count = self.projects.projects().len();
         let presence_count = self.presence.len();
         let mut collaborator_rows = v_flex().gap_0p5();
@@ -1793,12 +1895,13 @@ impl Render for PaperPanel {
             let disabled = self.initializing_project.is_some()
                 || self.creating_project
                 || self.trashing_project_id.is_some();
-            let status_label = if is_current {
-                "Live".to_string()
-            } else {
-                project.access_label()
-            };
             let updated_label = project.updated_label();
+            let access_label = project.access_label();
+            let row_metadata = updated_label
+                .as_deref()
+                .map(|updated| format!("{access_label} · {updated}"))
+                .unwrap_or_else(|| access_label.clone());
+            let project_tooltip = format!("{} · {row_metadata}", project.name);
             let action_menu = project.trash_action().map(|action| {
                 let panel = cx.weak_entity();
                 let action_project = project.clone();
@@ -1848,6 +1951,8 @@ impl Render for PaperPanel {
                 .rounded()
                 .disabled(disabled)
                 .toggle_state(is_current)
+                .aria_label(format!("{} · {row_metadata}", project.name))
+                .tooltip(Tooltip::text(project_tooltip))
                 .start_slot(
                     Icon::new(if project.is_read_only_bucket() {
                         IconName::Archive
@@ -1861,17 +1966,6 @@ impl Render for PaperPanel {
                         Color::Accent
                     }),
                 )
-                .end_slot(
-                    h_flex().flex_none().child(
-                        Label::new(status_label)
-                            .size(LabelSize::XSmall)
-                            .color(if is_current {
-                                Color::Accent
-                            } else {
-                                Color::Muted
-                            }),
-                    ),
-                )
                 .child(
                     v_flex()
                         .min_w_0()
@@ -1882,18 +1976,25 @@ impl Render for PaperPanel {
                                 .weight(FontWeight::MEDIUM)
                                 .truncate(),
                         )
-                        .when_some(updated_label, |this, updated_label| {
-                            this.child(
-                                Label::new(updated_label)
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .truncate(),
-                            )
-                        }),
+                        .child(
+                            Label::new(row_metadata)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.choose_local_replica(project.clone(), window, cx);
                 }));
+            if is_current {
+                project_row = project_row.end_slot(
+                    h_flex().flex_none().child(
+                        Label::new("Live")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Accent),
+                    ),
+                );
+            }
             if let Some(action_menu) = action_menu {
                 project_row = project_row.end_slot_on_hover(action_menu);
             }
@@ -1935,16 +2036,20 @@ impl Render for PaperPanel {
                         h_flex()
                             .gap_1()
                             .child(
-                                Button::new("semantic-zed-new-project", "New project")
-                                    .style(ButtonStyle::Tinted(TintColor::Accent))
+                                IconButton::new("semantic-zed-new-project", IconName::Plus)
+                                    .icon_size(IconSize::Small)
+                                    .style(ButtonStyle::Subtle)
+                                    .tooltip(Tooltip::text("New Overleaf project"))
                                     .disabled(!connected || self.creating_project)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.show_new_project_form(window, cx);
                                     })),
                             )
                             .child(
-                                Button::new("semantic-zed-project-refresh", "Refresh")
-                                    .style(ButtonStyle::Transparent)
+                                IconButton::new("semantic-zed-project-refresh", IconName::RotateCw)
+                                    .icon_size(IconSize::Small)
+                                    .style(ButtonStyle::Subtle)
+                                    .tooltip(Tooltip::text("Refresh Overleaf projects"))
                                     .disabled(
                                         !connected
                                             || self.creating_project
@@ -1953,89 +2058,38 @@ impl Render for PaperPanel {
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.refresh_projects(window, cx);
                                     })),
-                            ),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .min_w_0()
-                    .gap_2()
-                    .p_3()
-                    .bg(palette.card)
-                    .border_1()
-                    .border_color(palette.divider)
-                    .rounded_lg()
-                    .shadow(palette.card_shadow.clone())
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(
-                                        if connected {
-                                            cx.theme().status().success
-                                        } else {
-                                            cx.theme().colors().text_muted
-                                        },
-                                    ))
-                                    .child(
-                                        Label::new(if connected {
-                                            "Overleaf connected"
-                                        } else {
-                                            "Connect your Overleaf account"
-                                        })
-                                        .size(LabelSize::Small)
-                                        .weight(FontWeight::MEDIUM),
-                                    ),
                             )
-                            .child(
-                                Button::new("semantic-zed-login", login_button_label)
-                                    .style(if connected {
-                                        ButtonStyle::Transparent
-                                    } else {
-                                        ButtonStyle::Tinted(TintColor::Accent)
-                                    })
-                                    .disabled(self.login.is_in_progress())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.login_to_overleaf(window, cx);
-                                    })),
-                            ),
-                    )
-                    .child(
-                        Label::new(login_text)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                            .child(div().ml_1().w(px(7.0)).h(px(7.0)).rounded_full().bg(
+                                if connected {
+                                    cx.theme().status().success
+                                } else {
+                                    cx.theme().colors().text_muted
+                                },
+                            ))
+                            .child(account_menu),
                     ),
             )
+            .when_some(self.login.transient_message(), |this, message| {
+                this.child(
+                    Label::new(message)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+            })
             .child(
                 h_flex()
                     .w_full()
                     .min_w_0()
-                    .gap_2()
-                    .justify_between()
+                    .gap_1()
                     .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                Label::new("Projects")
-                                    .size(LabelSize::Small)
-                                    .weight(FontWeight::SEMIBOLD),
-                            )
-                            .child(
-                                Label::new(format!("{project_count} projects"))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
+                        Label::new("Projects")
+                            .size(LabelSize::Small)
+                            .weight(FontWeight::SEMIBOLD),
                     )
                     .child(
-                        div().flex_1().min_w_0().child(
-                            Label::new(self.projects.summary())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .truncate(),
-                        ),
+                        Label::new(format!("· {project_count}"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
                     ),
             )
             .when(self.show_new_project_form, |this| {
@@ -2097,37 +2151,48 @@ impl Render for PaperPanel {
                             .weight(FontWeight::SEMIBOLD)
                             .truncate(),
                     )
-                    .when_some(linked_project_metadata, |this, metadata| {
+                    .when_some(current_status_detail, |this, detail| {
                         this.child(
-                            Label::new(metadata)
+                            Label::new(detail)
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted)
                                 .truncate(),
                         )
                     })
                     .child(
-                        Label::new(status_text)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .truncate(),
-                    )
-                    .child(
-                        v_flex()
+                        h_flex()
+                            .id("semantic-zed-local-folder")
+                            .w_full()
                             .min_w_0()
-                            .gap_0p5()
+                            .gap_1()
                             .pt_1()
                             .border_t_1()
                             .border_color(palette.divider)
                             .child(
-                                Label::new("Local folder")
-                                    .size(LabelSize::XSmall)
+                                Icon::new(IconName::FolderOpen)
+                                    .size(IconSize::XSmall)
                                     .color(Color::Muted),
                             )
                             .child(
-                                Label::new(root_text)
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .truncate(),
+                                div()
+                                    .id("semantic-zed-local-folder-path")
+                                    .flex_1()
+                                    .min_w_0()
+                                    .tooltip(Tooltip::text(root_text.clone()))
+                                    .child(
+                                        Label::new(root_text.clone())
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    ),
+                            )
+                            .child(
+                                CopyButton::new(
+                                    "semantic-zed-copy-local-folder",
+                                    root_text.clone(),
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .tooltip_label("Copy local folder"),
                             ),
                     )
                     .when(presence_count > 0, |this| {
@@ -2158,14 +2223,16 @@ impl Render for PaperPanel {
                         h_flex()
                             .flex_wrap()
                             .gap_1()
-                            .child(
-                                Button::new("semantic-zed-start-sync", "Start sync")
-                                    .style(ButtonStyle::OutlinedGhost)
-                                    .disabled(!has_root || !connected)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.start_sync(window, cx);
-                                    })),
-                            )
+                            .when(!self.status.is_live(), |this| {
+                                this.child(
+                                    Button::new("semantic-zed-start-sync", "Sync")
+                                        .style(ButtonStyle::OutlinedGhost)
+                                        .disabled(!has_root || !connected)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.start_sync(window, cx);
+                                        })),
+                                )
+                            })
                             .child(
                                 Button::new("semantic-zed-compile", "Compile")
                                     .style(ButtonStyle::Tinted(TintColor::Accent))
@@ -2175,7 +2242,7 @@ impl Render for PaperPanel {
                                     })),
                             )
                             .child(
-                                Button::new("semantic-zed-preview-pdf", "Preview PDF")
+                                Button::new("semantic-zed-preview-pdf", "PDF")
                                     .style(ButtonStyle::OutlinedGhost)
                                     .disabled(!has_root)
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -2256,37 +2323,12 @@ enum LoginState {
 }
 
 impl LoginState {
-    fn from_result(result: Result<()>) -> Self {
-        if result.is_ok() {
-            Self::Connected
-        } else {
-            Self::Failed
-        }
-    }
-
-    fn from_saved_status(result: Result<bool>) -> Self {
-        match result {
-            Ok(true) => Self::Connected,
-            Ok(false) => Self::NotConnected,
-            Err(_) => Self::Failed,
-        }
-    }
-
-    fn summary(&self) -> &'static str {
+    fn transient_message(&self) -> Option<&'static str> {
         match self {
-            Self::Checking => "Checking the saved Overleaf connection…",
-            Self::NotConnected => {
-                "Opens a protected browser window. If Arc is already running, another compatible browser is used instead of starting a second Arc instance."
-            }
-            Self::OpeningBrowser => {
-                "The app-owned browser window is open. Finish signing in there; later reauthentication reuses its saved SSO session."
-            }
-            Self::Connected => {
-                "Connected securely. The Overleaf session is stored in macOS Keychain."
-            }
-            Self::Failed => {
-                "The private browser login did not complete. Retry Connect to Overleaf."
-            }
+            Self::Checking => Some("Checking your Overleaf account…"),
+            Self::OpeningBrowser => Some("Finish signing in in the browser window…"),
+            Self::Failed => Some("Overleaf connection failed. Open the account menu to retry."),
+            Self::NotConnected | Self::Connected => None,
         }
     }
 
@@ -2294,7 +2336,7 @@ impl LoginState {
         matches!(self, Self::Checking | Self::OpeningBrowser)
     }
 
-    fn button_label(&self) -> &'static str {
+    fn account_action_label(&self) -> &'static str {
         match self {
             Self::Connected => "Reauthenticate",
             Self::Failed => "Retry Connect",
@@ -2439,24 +2481,13 @@ impl ProjectListState {
         }
     }
 
-    fn summary(&self) -> &'static str {
-        match self {
-            Self::NotConnected => "Connect an Overleaf account to browse projects.",
-            Self::Loading { previous } if previous.is_empty() => "Loading your Overleaf projects…",
-            Self::Loading { .. } => "Refreshing Overleaf projects…",
-            Self::Ready(projects) if projects.is_empty() => "No Overleaf projects found.",
-            Self::Ready(_) => "Choose a project to create or open its local replica.",
-            Self::Error { previous, .. } if previous.is_empty() => {
-                "Could not load Overleaf projects."
-            }
-            Self::Error { .. } => "Showing the last update. Refresh failed.",
-        }
-    }
-
     fn detail(&self) -> Option<&str> {
         match self {
+            Self::Loading { previous } if previous.is_empty() => Some("Loading projects…"),
+            Self::Loading { .. } => Some("Refreshing projects…"),
+            Self::Ready(projects) if projects.is_empty() => Some("No projects found."),
             Self::Error { message, .. } => Some(message),
-            _ => None,
+            Self::NotConnected | Self::Ready(_) => None,
         }
     }
 
@@ -2605,13 +2636,24 @@ struct PendingDocumentSnapshot {
     materialization: NativeSnapshotMaterialization,
 }
 
-async fn login_with_browser() -> Result<()> {
-    authenticate_with_browser(OVERLEAF_SERVER).await?;
+async fn login_with_browser() -> Result<Identity> {
+    Ok(authenticate_with_browser(OVERLEAF_SERVER).await?.identity)
+}
+
+fn load_saved_identity() -> Result<Option<Identity>> {
+    Ok(CredentialStore::default()
+        .load(OVERLEAF_SERVER)?
+        .map(|record| record.identity))
+}
+
+fn remove_saved_login() -> Result<()> {
+    CredentialStore::default().delete(OVERLEAF_SERVER)?;
     Ok(())
 }
 
-fn saved_login_exists() -> Result<bool> {
-    Ok(CredentialStore::default().load(OVERLEAF_SERVER)?.is_some())
+fn account_email(identity: &Identity) -> Option<String> {
+    let email = identity.user_email.trim();
+    (!email.is_empty()).then(|| email.to_string())
 }
 
 async fn native_http_client() -> Result<(OverleafHttpClient, Identity)> {
@@ -2899,20 +2941,6 @@ fn collaborator_initial(name: &str) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
-fn short_project_id(project_id: &str) -> String {
-    let characters = project_id.chars().collect::<Vec<_>>();
-    if characters.len() <= 14 {
-        return project_id.to_string();
-    }
-    format!(
-        "{}…{}",
-        characters[..8].iter().collect::<String>(),
-        characters[characters.len() - 4..]
-            .iter()
-            .collect::<String>()
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3015,18 +3043,30 @@ mod tests {
     }
 
     #[test]
-    fn renders_unicode_safe_collaborator_initials_and_project_ids() {
+    fn renders_unicode_safe_collaborator_initials() {
         assert_eq!(collaborator_initial("Alex Lee"), "A");
         assert_eq!(collaborator_initial(" 나영주"), "나");
         assert_eq!(collaborator_initial("👩🏽‍💻 Researcher"), "R");
         assert_eq!(collaborator_initial("✨"), "✨");
         assert_eq!(collaborator_initial("  "), "?");
+    }
 
-        assert_eq!(short_project_id("paper-1"), "paper-1");
+    #[test]
+    fn exposes_only_a_nonempty_saved_email_to_the_account_menu() {
+        let identity = Identity {
+            cookies: "session=secret".to_string(),
+            csrf_token: "csrf-secret".to_string(),
+            user_id: "user-1".to_string(),
+            user_email: "  alex@example.com  ".to_string(),
+        };
         assert_eq!(
-            short_project_id("6a78e74ad29d6694dc52f58a"),
-            "6a78e74a…f58a"
+            account_email(&identity).as_deref(),
+            Some("alex@example.com")
         );
+
+        let mut identity_without_email = identity;
+        identity_without_email.user_email = "   ".to_string();
+        assert_eq!(account_email(&identity_without_email), None);
     }
 
     #[test]
@@ -3043,12 +3083,11 @@ mod tests {
             previous: previous.clone(),
         };
         assert_eq!(loading.projects()[0].id, "paper-1");
-        assert_eq!(loading.summary(), "Refreshing Overleaf projects…");
+        assert_eq!(loading.detail(), Some("Refreshing projects…"));
 
         let failed =
             ProjectListState::from_result(Err(anyhow!("temporary network failure")), previous);
         assert_eq!(failed.projects()[0].name, "Last known paper");
-        assert_eq!(failed.summary(), "Showing the last update. Refresh failed.");
         assert_eq!(failed.detail(), Some("temporary network failure"));
     }
 
