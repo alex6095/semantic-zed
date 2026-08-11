@@ -95,6 +95,12 @@ jobs:
     steps:
       - name: Check out Semantic Zed
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: Configure Windows Cargo paths
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path $env:CARGO_HOME -Force | Out-Null
+          'C:\c\bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          git config --global core.longpaths true
       - name: Ensure Inno Setup is available
         shell: pwsh
         run: |
