@@ -11,12 +11,9 @@ use util::rel_path::RelPath;
 /// A default editorconfig file name to use when resolving project settings.
 pub const EDITORCONFIG_NAME: &str = ".editorconfig";
 
-/// The application name, used to derive platform-specific data, config, cache,
-/// and state directory paths.
-///
-/// Semantic Zed intentionally keeps its preferences, extensions, databases,
-/// and crash data separate from an upstream Zed installation.
-pub const APP_NAME: &str = "Semantic Zed";
+/// The internal executable name. This must stay aligned with the `zed` binary
+/// because `crates/zed/src/main.rs` verifies that invariant at compile time.
+pub const APP_NAME: &str = "Zed";
 
 /// Lowercased form of [`APP_NAME`], for use in XDG-style paths on
 /// Linux/FreeBSD and the macOS `~/.config` fallback.
@@ -47,6 +44,14 @@ pub const APP_NAME_LOWERCASE: &str = {
     }
 };
 
+/// The public product name used for all local Semantic Zed state. It is kept
+/// separate from [`APP_NAME`] so the fork can retain Zed's internal binary
+/// protocol while never sharing user data with an upstream Zed installation.
+pub const PRODUCT_NAME: &str = "Semantic Zed";
+
+/// Filesystem-safe XDG form of [`PRODUCT_NAME`].
+pub const PRODUCT_NAME_LOWERCASE: &str = "semantic-zed";
+
 /// A custom data directory override, set only by `set_custom_data_dir`.
 /// This is used to override the default data directory location.
 /// The directory will be created if it doesn't exist when set.
@@ -55,14 +60,14 @@ static CUSTOM_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// The resolved data directory, combining custom override or platform defaults.
 /// This is set once and cached for subsequent calls.
 /// On macOS, this is `~/Library/Application Support/Semantic Zed`.
-/// On Linux/FreeBSD, this is `$XDG_DATA_HOME/semantic zed`.
+/// On Linux/FreeBSD, this is `$XDG_DATA_HOME/semantic-zed`.
 /// On Windows, this is `%LOCALAPPDATA%\Semantic Zed`.
 static CURRENT_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The resolved config directory, combining custom override or platform defaults.
 /// This is set once and cached for subsequent calls.
-/// On macOS, this is `~/.config/semantic zed`.
-/// On Linux/FreeBSD, this is `$XDG_CONFIG_HOME/semantic zed`.
+/// On macOS, this is `~/.config/semantic-zed`.
+/// On Linux/FreeBSD, this is `$XDG_CONFIG_HOME/semantic-zed`.
 /// On Windows, this is `%APPDATA%\Semantic Zed`.
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -127,16 +132,16 @@ pub fn config_dir() -> &'static PathBuf {
         } else if cfg!(target_os = "windows") {
             dirs::config_dir()
                 .expect("failed to determine RoamingAppData directory")
-                .join(APP_NAME)
+                .join(PRODUCT_NAME)
         } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             if let Ok(flatpak_xdg_config) = std::env::var("FLATPAK_XDG_CONFIG_HOME") {
                 flatpak_xdg_config.into()
             } else {
                 dirs::config_dir().expect("failed to determine XDG_CONFIG_HOME directory")
             }
-            .join(APP_NAME_LOWERCASE)
+            .join(PRODUCT_NAME_LOWERCASE)
         } else {
-            home_dir().join(".config").join(APP_NAME_LOWERCASE)
+            home_dir().join(".config").join(PRODUCT_NAME_LOWERCASE)
         }
     })
 }
@@ -149,18 +154,18 @@ pub fn data_dir() -> &'static PathBuf {
         } else if cfg!(target_os = "macos") {
             home_dir()
                 .join("Library/Application Support")
-                .join(APP_NAME)
+                .join(PRODUCT_NAME)
         } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             if let Ok(flatpak_xdg_data) = std::env::var("FLATPAK_XDG_DATA_HOME") {
                 flatpak_xdg_data.into()
             } else {
                 dirs::data_local_dir().expect("failed to determine XDG_DATA_HOME directory")
             }
-            .join(APP_NAME_LOWERCASE)
+            .join(PRODUCT_NAME_LOWERCASE)
         } else if cfg!(target_os = "windows") {
             dirs::data_local_dir()
                 .expect("failed to determine LocalAppData directory")
-                .join(APP_NAME)
+                .join(PRODUCT_NAME)
         } else {
             config_dir().clone() // Fallback
         }
@@ -171,7 +176,7 @@ pub fn state_dir() -> &'static PathBuf {
     static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
     STATE_DIR.get_or_init(|| {
         if cfg!(target_os = "macos") {
-            return home_dir().join(".local").join("state").join(APP_NAME);
+            return home_dir().join(".local").join("state").join(PRODUCT_NAME);
         }
 
         if cfg!(any(target_os = "linux", target_os = "freebsd")) {
@@ -180,12 +185,12 @@ pub fn state_dir() -> &'static PathBuf {
             } else {
                 dirs::state_dir().expect("failed to determine XDG_STATE_HOME directory")
             }
-            .join(APP_NAME_LOWERCASE);
+            .join(PRODUCT_NAME_LOWERCASE);
         } else {
             // Windows
             return dirs::data_local_dir()
                 .expect("failed to determine LocalAppData directory")
-                .join(APP_NAME);
+                .join(PRODUCT_NAME);
         }
     })
 }
@@ -197,13 +202,13 @@ pub fn temp_dir() -> &'static PathBuf {
         if cfg!(target_os = "macos") {
             return dirs::cache_dir()
                 .expect("failed to determine cachesDirectory directory")
-                .join(APP_NAME);
+                .join(PRODUCT_NAME);
         }
 
         if cfg!(target_os = "windows") {
             return dirs::cache_dir()
                 .expect("failed to determine LocalAppData directory")
-                .join(APP_NAME);
+                .join(PRODUCT_NAME);
         }
 
         if cfg!(any(target_os = "linux", target_os = "freebsd")) {
@@ -212,10 +217,10 @@ pub fn temp_dir() -> &'static PathBuf {
             } else {
                 dirs::cache_dir().expect("failed to determine XDG_CACHE_HOME directory")
             }
-            .join(APP_NAME_LOWERCASE);
+            .join(PRODUCT_NAME_LOWERCASE);
         }
 
-        home_dir().join(".cache").join(APP_NAME_LOWERCASE)
+        home_dir().join(".cache").join(PRODUCT_NAME_LOWERCASE)
     })
 }
 
@@ -230,7 +235,7 @@ pub fn logs_dir() -> &'static PathBuf {
     static LOGS_DIR: OnceLock<PathBuf> = OnceLock::new();
     LOGS_DIR.get_or_init(|| {
         if cfg!(target_os = "macos") {
-            home_dir().join("Library/Logs").join(APP_NAME)
+            home_dir().join("Library/Logs").join(PRODUCT_NAME)
         } else {
             data_dir().join("logs")
         }
@@ -246,13 +251,13 @@ pub fn remote_server_state_dir() -> &'static PathBuf {
 /// Returns the path to the `Zed.log` file.
 pub fn log_file() -> &'static PathBuf {
     static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
-    LOG_FILE.get_or_init(|| logs_dir().join(format!("{}.log", APP_NAME)))
+    LOG_FILE.get_or_init(|| logs_dir().join(format!("{}.log", PRODUCT_NAME)))
 }
 
 /// Returns the path to the `Zed.log.old` file.
 pub fn old_log_file() -> &'static PathBuf {
     static OLD_LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
-    OLD_LOG_FILE.get_or_init(|| logs_dir().join(format!("{}.log.old", APP_NAME)))
+    OLD_LOG_FILE.get_or_init(|| logs_dir().join(format!("{}.log.old", PRODUCT_NAME)))
 }
 
 /// Returns the path to the database directory.
@@ -338,10 +343,10 @@ pub fn agents_file() -> &'static PathBuf {
 /// readability in announcement copy.
 #[cfg(target_os = "windows")]
 pub const GLOBAL_AGENTS_FILE_DISPLAY: &str =
-    const_format::concatcp!("%APPDATA%\\", APP_NAME, "\\AGENTS.md");
+    const_format::concatcp!("%APPDATA%\\", PRODUCT_NAME, "\\AGENTS.md");
 #[cfg(not(target_os = "windows"))]
 pub const GLOBAL_AGENTS_FILE_DISPLAY: &str =
-    const_format::concatcp!("~/.config/", APP_NAME_LOWERCASE, "/AGENTS.md");
+    const_format::concatcp!("~/.config/", PRODUCT_NAME_LOWERCASE, "/AGENTS.md");
 
 /// Returns the path to the extensions directory.
 ///
