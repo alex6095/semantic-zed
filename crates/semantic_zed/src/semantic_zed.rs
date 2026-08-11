@@ -1713,6 +1713,11 @@ impl Render for PaperPanel {
         let current_status_detail = (!self.status.is_live()).then(|| self.status.summary());
 
         let connected = matches!(&self.login, LoginState::Connected);
+        let connection_status_label = if connected {
+            "Connected to Overleaf"
+        } else {
+            "Overleaf not connected"
+        };
         let account_label = self
             .account_email
             .clone()
@@ -2030,7 +2035,26 @@ impl Render for PaperPanel {
                                             .color(Color::Accent),
                                     ),
                             )
-                            .child(Label::new("Overleaf").weight(FontWeight::SEMIBOLD)),
+                            .child(Label::new("Overleaf").weight(FontWeight::SEMIBOLD))
+                            // Connection state belongs to the Overleaf identity, not to
+                            // the neighbouring command buttons. Keep the hit target large
+                            // enough for its explanatory tooltip without making it an action.
+                            .child(
+                                h_flex()
+                                    .id("semantic-zed-overleaf-connection-state")
+                                    .h_6()
+                                    .px_1()
+                                    .items_center()
+                                    .aria_label(connection_status_label)
+                                    .tooltip(Tooltip::text(connection_status_label))
+                                    .child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(
+                                        if connected {
+                                            cx.theme().status().success
+                                        } else {
+                                            cx.theme().colors().text_muted
+                                        },
+                                    )),
+                            ),
                     )
                     .child(
                         h_flex()
@@ -2059,13 +2083,6 @@ impl Render for PaperPanel {
                                         this.refresh_projects(window, cx);
                                     })),
                             )
-                            .child(div().ml_1().w(px(7.0)).h(px(7.0)).rounded_full().bg(
-                                if connected {
-                                    cx.theme().status().success
-                                } else {
-                                    cx.theme().colors().text_muted
-                                },
-                            ))
                             .child(account_menu),
                     ),
             )

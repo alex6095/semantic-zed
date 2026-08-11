@@ -11,6 +11,9 @@ upstream application version.
 - Replaced the verbose Overleaf account card with compact native header actions
   and an account popover showing the saved account email, reauthentication, and
   local disconnect.
+- Attached the passive Overleaf connection dot to the Overleaf identity rather
+  than placing it between command buttons; the far-right account control stays
+  the final actionable item.
 - Reduced the current-project card to the remote project name, live state, local
   folder, collaborators, and direct Sync/Compile/PDF actions. The full local
   path is available by tooltip and copy button.
