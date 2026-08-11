@@ -485,9 +485,9 @@ impl PaperPanel {
             .ok()
             .map(|config| config.project_id);
 
-        self.status = PaperStatus::Loading;
-        cx.notify();
         if let Some(handle) = self.native_sync.clone() {
+            self.status = PaperStatus::Loading;
+            cx.notify();
             let status_task = Tokio::spawn_result(cx, async move {
                 handle.status().await.map_err(anyhow::Error::from)
             });
@@ -498,6 +498,21 @@ impl PaperPanel {
                 })
                 .log_err();
             });
+            return;
+        }
+
+        // Authentication discovery and sync ownership are separate asynchronous
+        // operations. Do not start an actor speculatively while CredentialStore
+        // is still being checked: its single deterministic completion below
+        // starts this root exactly once when a saved identity is available.
+        if !matches!(&self.login, LoginState::Connected) {
+            self.status = if self.login.is_in_progress() {
+                PaperStatus::Loading
+            } else {
+                PaperStatus::Unavailable
+            };
+            self.clear_presence(window, cx);
+            cx.notify();
             return;
         }
 
@@ -624,7 +639,11 @@ impl PaperPanel {
                 if matches!(&this.login, LoginState::Connected) {
                     this.refresh_projects(window, cx);
                 }
-                cx.notify();
+                if this.paper_root.is_some() {
+                    this.refresh_current_root(window, cx);
+                } else {
+                    cx.notify();
+                }
             })
             .log_err();
         });
@@ -2142,7 +2161,7 @@ impl Render for PaperPanel {
                             .child(
                                 Button::new("semantic-zed-start-sync", "Start sync")
                                     .style(ButtonStyle::OutlinedGhost)
-                                    .disabled(!has_root)
+                                    .disabled(!has_root || !connected)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.start_sync(window, cx);
                                     })),
