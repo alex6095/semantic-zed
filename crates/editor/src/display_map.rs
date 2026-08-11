@@ -2061,6 +2061,20 @@ impl DisplaySnapshot {
             vertical_scroll_margin: _,
         }: &TextLayoutDetails,
     ) -> Arc<LineLayout> {
+        if self.maps_points_identically() {
+            let buffer = self.buffer_snapshot();
+            let line_len = buffer.line_len(MultiBufferRow(display_row.0));
+            let mut line = String::with_capacity(line_len as usize);
+            for chunk in buffer
+                .text_for_range(Point::new(display_row.0, 0)..Point::new(display_row.0, line_len))
+            {
+                line.push_str(chunk);
+            }
+            let font_size = editor_style.text.font_size.to_pixels(*rem_size);
+            let runs = [editor_style.text.to_run(line.len())];
+            return text_system.layout_line(&line, font_size, &runs, None);
+        }
+
         let mut runs = Vec::new();
         let mut line = String::new();
 
