@@ -2,10 +2,10 @@
 AppId={#AppId}
 AppName={#AppName}
 AppVerName={#AppDisplayName}
-AppPublisher=Zed Industries
-AppPublisherURL=https://www.zed.dev/
-AppSupportURL=https://www.zed.dev/
-AppUpdatesURL=https://www.zed.dev/
+AppPublisher=Semantic Zed contributors
+AppPublisherURL=https://github.com/alex6095/semantic-zed
+AppSupportURL=https://github.com/alex6095/semantic-zed/issues
+AppUpdatesURL=https://github.com/alex6095/semantic-zed/releases
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 DisableReadyPage=yes
@@ -52,6 +52,7 @@ Type: filesandordirs; Name: "{app}\updates"
 ; Delete newer files which may not have been added by the initial installation
 Type: filesandordirs; Name: "{app}\x64"
 Type: filesandordirs; Name: "{app}\arm64"
+Type: filesandordirs; Name: "{app}\resources\pdfium"
 
 
 [Tasks]
@@ -68,7 +69,12 @@ Name: "{app}"; AfterInstall: DisableAppDirInheritance
 Source: "{#ResourcesDir}\Zed.exe"; DestDir: "{code:GetInstallDir}"; Flags: ignoreversion
 Source: "{#ResourcesDir}\bin\*"; DestDir: "{code:GetInstallDir}\bin"; Flags: ignoreversion
 Source: "{#ResourcesDir}\tools\*"; DestDir: "{app}\tools"; Flags: ignoreversion
+#ifexist ResourcesDir + "\appx\zed_explorer_command_injector.appx"
 Source: "{#ResourcesDir}\appx\*"; DestDir: "{app}\appx";  BeforeInstall: RemoveAppxPackage; AfterInstall: AddAppxPackage; Flags: ignoreversion; Check: IsWindows11OrLater
+#endif
+#ifexist ResourcesDir + "\resources\pdfium\pdfium.dll"
+Source: "{#ResourcesDir}\resources\pdfium\*"; DestDir: "{app}\resources\pdfium"; Flags: ignoreversion recursesubdirs createallsubdirs
+#endif
 #ifexist ResourcesDir + "\amd_ags_x64.dll"
 Source: "{#ResourcesDir}\amd_ags_x64.dll"; DestDir: "{app}"; Flags: ignoreversion
 #endif
@@ -88,7 +94,7 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}.exe"; Tasks: de
 Filename: "{app}\{#AppExeName}.exe"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall; Check: WizardNotSilent
 
 [UninstallRun]
-Filename: "powershell.exe"; Parameters: "Invoke-Command -ScriptBlock {{Remove-AppxPackage -Package ""{#AppxFullName}""}"; Check: IsWindows11OrLater; Flags: shellexec waituntilterminated runhidden
+Filename: "powershell.exe"; Parameters: "Invoke-Command -ScriptBlock {{Remove-AppxPackage -Package ""{#AppxFullName}""}"; Check: IsWindows11OrLater and HasExplorerCommandInjector; Flags: shellexec waituntilterminated runhidden
 
 [Registry]
 Root: HKCU; Subkey: "Software\Classes\.ascx\OpenWithProgids"; ValueType: none; ValueName: "{#RegValueName}"; Flags: deletevalue uninsdeletevalue; Tasks: associatewithfiles
@@ -1360,11 +1366,16 @@ begin
   Exec(ExpandConstant('{sys}\icacls.exe'), ExpandConstant('"{app}" /inheritancelevel:r ') + Permissions, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
+function HasExplorerCommandInjector: Boolean;
+begin
+  Result := FileExists(ExpandConstant('{app}\appx\zed_explorer_command_injector.appx'));
+end;
+
 procedure AddAppxPackage();
 var
   AddAppxPackageResultCode: Integer;
 begin
-  if WizardIsTaskSelected('addcontextmenufiles') then begin
+  if WizardIsTaskSelected('addcontextmenufiles') and HasExplorerCommandInjector then begin
     ShellExec('', 'powershell.exe', '-Command ' + AddQuotes('Add-AppxPackage -Path ''' + ExpandConstant('{app}\appx\zed_explorer_command_injector.appx') + ''' -ExternalLocation ''' + ExpandConstant('{app}\appx') + ''''), '', SW_HIDE, ewWaitUntilTerminated, AddAppxPackageResultCode);
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\*\shell\{#RegValueName}');
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\directory\shell\{#RegValueName}');
@@ -1377,7 +1388,9 @@ procedure RemoveAppxPackage();
 var
   RemoveAppxPackageResultCode: Integer;
 begin
-  ShellExec('', 'powershell.exe', '-Command ' + AddQuotes('Remove-AppxPackage -Package ''{#AppxFullName}'''), '', SW_HIDE, ewWaitUntilTerminated, RemoveAppxPackageResultCode);
+  if HasExplorerCommandInjector then begin
+    ShellExec('', 'powershell.exe', '-Command ' + AddQuotes('Remove-AppxPackage -Package ''{#AppxFullName}'''), '', SW_HIDE, ewWaitUntilTerminated, RemoveAppxPackageResultCode);
+  end;
   if not WizardIsTaskSelected('addcontextmenufiles') then begin
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\{#RegValueName}ContextMenu');
   end;

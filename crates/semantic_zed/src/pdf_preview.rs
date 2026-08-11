@@ -39,7 +39,7 @@ static PDFIUM_INITIALIZATION_LOCK: Mutex<()> = Mutex::new(());
 /// The UI is entirely GPUI. Page rasterization goes through PDFium, loaded
 /// from the application bundle rather than through a browser webview or an
 /// operating-system PDF app. The macOS, Windows, and Linux packagers place the
-/// appropriate Pdfium shared library in the same `Resources/pdfium` location.
+/// appropriate PDFium shared library in their app-local resource location.
 pub struct PdfPreviewPanel {
     focus_handle: FocusHandle,
     pdf_path: Option<PathBuf>,

@@ -142,15 +142,32 @@ if [ "$channel" != "stable" ]; then
   suffix="-$channel"
 fi
 
+app_bundle_name="zed$suffix"
+if [[ "$channel" == "dev" ]]; then
+  # Semantic Zed must be installable beside upstream Zed without competing for
+  # its application directory or CLI name.
+  app_bundle_name="semantic-zed"
+fi
+
 # Move everything that should end up in the final package
 # into a temp directory.
 temp_dir=$(mktemp -d)
-zed_dir="${temp_dir}/zed$suffix.app"
+zed_dir="${temp_dir}/${app_bundle_name}.app"
 
 # Binary
 mkdir -p "${zed_dir}/bin" "${zed_dir}/libexec"
 cp "${target_dir}/${target_triple}/release/zed" "${zed_dir}/libexec/zed-editor"
-cp "${target_dir}/${target_triple}/release/cli" "${zed_dir}/bin/zed"
+if [[ "$channel" == "dev" ]]; then
+  cp "${target_dir}/${target_triple}/release/cli" "${zed_dir}/bin/semantic-zed"
+else
+  cp "${target_dir}/${target_triple}/release/cli" "${zed_dir}/bin/zed"
+fi
+
+# Keep the native PDF renderer adjacent to the executable on Linux. The Rust
+# loader resolves libexec/resources/pdfium/libpdfium.so on all packaged builds.
+script/semantic-zed-pdfium.sh \
+  --target "${target_triple}" \
+  --destination "${zed_dir}/libexec/resources/pdfium"
 
 # Libs
 # Bundle libstdc++ so older supported systems can run binaries built with our
@@ -166,10 +183,14 @@ rm -rf "${zed_dir}/lib/*"
 cp $(find_libs) "${zed_dir}/lib"
 
 # Icons
+icon_name="zed"
+if [[ "$channel" == "dev" ]]; then
+  icon_name="semantic-zed"
+fi
 mkdir -p "${zed_dir}/share/icons/hicolor/512x512/apps"
-cp "crates/zed/resources/app-icon$suffix.png" "${zed_dir}/share/icons/hicolor/512x512/apps/zed.png"
+cp "crates/zed/resources/app-icon$suffix.png" "${zed_dir}/share/icons/hicolor/512x512/apps/${icon_name}.png"
 mkdir -p "${zed_dir}/share/icons/hicolor/1024x1024/apps"
-cp "crates/zed/resources/app-icon$suffix@2x.png" "${zed_dir}/share/icons/hicolor/1024x1024/apps/zed.png"
+cp "crates/zed/resources/app-icon$suffix@2x.png" "${zed_dir}/share/icons/hicolor/1024x1024/apps/${icon_name}.png"
 
 # .desktop
 export DO_STARTUP_NOTIFY="true"
@@ -183,8 +204,10 @@ elif [[ "$channel" == "nightly" ]]; then
   export APP_NAME="Zed Nightly"
   APP_ID="dev.zed.Zed-Nightly"
 elif [[ "$channel" == "dev" ]]; then
-  export APP_NAME="Zed Devel"
-  APP_ID="dev.zed.Zed-Dev"
+  export APP_NAME="Semantic Zed"
+  export APP_CLI="semantic-zed"
+  export APP_ICON="semantic-zed"
+  APP_ID="dev.semantic-zed.SemanticZed"
 else
   export APP_NAME="Zed"
   APP_ID="dev.zed.Zed"
@@ -199,11 +222,11 @@ cp "assets/licenses.md" "${zed_dir}/licenses.md"
 
 # Create archive out of everything that's in the temp directory
 arch=$(uname -m)
-archive="zed-linux-${arch}.tar.gz"
+archive="semantic-zed-linux-${arch}.tar.gz"
 
 rm -rf "${archive}"
-remove_match="zed(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
+remove_match="semantic-zed-linux-$(uname -m)\.tar\.gz"
 ls "${target_dir}/release" | grep -E ${remove_match} | xargs -d "\n" -I {} rm -f "${target_dir}/release/{}" || true
-tar -czvf "${target_dir}/release/$archive" -C ${temp_dir} "zed$suffix.app"
+tar -czvf "${target_dir}/release/$archive" -C ${temp_dir} "${app_bundle_name}.app"
 
 gzip -f --stdout --best "${target_dir}/${remote_server_triple}/release/remote_server" > "${target_dir}/zed-remote-server-linux-${arch}.gz"

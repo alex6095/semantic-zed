@@ -34,8 +34,9 @@ Keep `origin` read-only for upstream synchronization and push the
 - `0.1.0-beta.N`: signed/notarized macOS preview with a documented update path
 - `0.1.0`: supported release after the declared platform/packaging checklist
 
-Do not tag `0.1.0-alpha.1` publicly until the new repository exists and its
-license/attribution files, commit range, and release notes have been reviewed.
+The public `alex6095/semantic-zed` repository now exists. Only tag a release
+after the cross-platform artifact workflow and the accompanying release
+checklist in [`RELEASES.md`](RELEASES.md) have passed.
 
 ## Licensing and distribution
 

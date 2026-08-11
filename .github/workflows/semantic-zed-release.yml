@@ -1,0 +1,151 @@
+name: Semantic Zed cross-platform release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'semantic-zed-v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: semantic-zed-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_RELEASE_DEBUG: '0'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64 bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Free ephemeral runner space
+        run: |
+          df -h .
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h .
+      - name: Check out Semantic Zed
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: Install Linux bundle dependencies
+        run: ./script/linux
+      - name: Bundle Semantic Zed
+        run: ./script/bundle-linux
+      - name: Verify bundled native PDF renderer
+        run: |
+          archive=target/release/semantic-zed-linux-x86_64.tar.gz
+          test -f "$archive"
+          tar -tzf "$archive" | grep -Fx 'semantic-zed.app/libexec/resources/pdfium/libpdfium.so'
+          tar -tzf "$archive" | grep -Fx 'semantic-zed.app/libexec/resources/pdfium/LICENSE.txt'
+          tar -tzf "$archive" | grep -Fx 'semantic-zed.app/libexec/resources/pdfium/licenses/pdfium.txt'
+          tar -tzf "$archive" | grep -Fx 'semantic-zed.app/bin/semantic-zed'
+      - name: Upload Linux bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: semantic-zed-linux-x86_64.tar.gz
+          path: target/release/semantic-zed-linux-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  macos-aarch64:
+    name: macOS Apple Silicon bundle
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - name: Check out Semantic Zed
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: Set up Node for DMG packaging
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24'
+          check-latest: true
+          package-manager-cache: false
+      - name: Bundle Semantic Zed
+        run: ./script/bundle-mac aarch64-apple-darwin
+      - name: Verify bundled native PDF renderer
+        run: |
+          dmg=target/aarch64-apple-darwin/release/Semantic-Zed-aarch64.dmg
+          test -f "$dmg"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint /tmp/semantic-zed-dmg
+          trap 'hdiutil detach /tmp/semantic-zed-dmg' EXIT
+          test -f '/tmp/semantic-zed-dmg/Semantic Zed.app/Contents/Resources/pdfium/libpdfium.dylib'
+          test -f '/tmp/semantic-zed-dmg/Semantic Zed.app/Contents/Resources/pdfium/LICENSE.txt'
+          test -f '/tmp/semantic-zed-dmg/Semantic Zed.app/Contents/Resources/pdfium/licenses/pdfium.txt'
+      - name: Upload macOS bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: Semantic-Zed-macos-aarch64.dmg
+          path: target/aarch64-apple-darwin/release/Semantic-Zed-aarch64.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-x86_64:
+    name: Windows x86_64 installer
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Check out Semantic Zed
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: Ensure Inno Setup is available
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ISCC.exe -ErrorAction SilentlyContinue) -and
+              -not (Test-Path 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe')) {
+            choco install innosetup --no-progress --yes
+          }
+      - name: Bundle Semantic Zed
+        shell: pwsh
+        run: ./script/bundle-windows.ps1 -Architecture x86_64
+      - name: Verify bundled native PDF renderer
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'inno\x86_64\resources\pdfium\pdfium.dll')) {
+            throw 'The Windows installer staging directory is missing pdfium.dll.'
+          }
+          if (-not (Test-Path 'inno\x86_64\resources\pdfium\LICENSE.txt') -or
+              -not (Test-Path 'inno\x86_64\resources\pdfium\licenses\pdfium.txt')) {
+            throw 'The Windows installer staging directory is missing PDFium license notices.'
+          }
+          if (-not (Test-Path 'target\Semantic-Zed-x86_64.exe')) {
+            throw 'The Windows installer was not produced.'
+          }
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: Semantic-Zed-windows-x86_64.exe
+          path: target/Semantic-Zed-x86_64.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub prerelease
+    if: startsWith(github.ref, 'refs/tags/semantic-zed-v')
+    needs: [linux-x86_64, macos-aarch64, windows-x86_64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified bundles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Create or update the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          title="Semantic Zed ${tag#semantic-zed-v}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release-assets/* --clobber
+          else
+            gh release create "$tag" release-assets/* \
+              --title "$title" \
+              --generate-notes \
+              --prerelease \
+              --notes 'Unsigned cross-platform alpha bundle. PDFium is bundled for native preview; sign-in uses the native Rust Overleaf integration. See RELEASES.md for verification and signing status.'
+          fi

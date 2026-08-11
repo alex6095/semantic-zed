@@ -40,8 +40,17 @@ function Get-VSArch {
     }
 }
 
+$vsDevShellCandidates = @(
+    'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\Launch-VsDevShell.ps1',
+    'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1',
+    'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Launch-VsDevShell.ps1'
+)
+$vsDevShell = $vsDevShellCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if (-not $vsDevShell) {
+    throw 'Could not find Visual Studio 2022 Launch-VsDevShell.ps1.'
+}
 Push-Location
-& "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
+& $vsDevShell -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
 Pop-Location
 
 $target = "$Architecture-pc-windows-msvc"
@@ -120,19 +129,26 @@ function BuildZedAndItsFriends {
     Copy-Item -Path ".\$CargoOutDir\zed.exe" -Destination "$innoDir\Zed.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\cli.exe" -Destination "$innoDir\cli.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\auto_update_helper.exe" -Destination "$innoDir\auto_update_helper.exe" -Force
-    # Build explorer_command_injector.dll
-    switch ($channel) {
-        "stable" {
-            cargo build --release --features stable --no-default-features --package explorer_command_injector --target $target
+
+    # Ship the pinned, checksum-verified native PDF renderer next to the
+    # installed executable. pdf_preview.rs resolves this exact location.
+    & "$PSScriptRoot\semantic-zed-pdfium.ps1" -Architecture $Architecture -Destination "$innoDir\resources\pdfium"
+    # The upstream AppX shell-extension package carries Zed Industries' package
+    # identity. Do not bundle it into the independent Semantic Zed product.
+    if ($channel -ne 'dev') {
+        switch ($channel) {
+            "stable" {
+                cargo build --release --features stable --no-default-features --package explorer_command_injector --target $target
+            }
+            "preview" {
+                cargo build --release --features preview --no-default-features --package explorer_command_injector --target $target
+            }
+            default {
+                cargo build --release --package explorer_command_injector --target $target
+            }
         }
-        "preview" {
-            cargo build --release --features preview --no-default-features --package explorer_command_injector --target $target
-        }
-        default {
-            cargo build --release --package explorer_command_injector --target $target
-        }
+        Copy-Item -Path ".\$CargoOutDir\explorer_command_injector.dll" -Destination "$innoDir\zed_explorer_command_injector.dll" -Force
     }
-    Copy-Item -Path ".\$CargoOutDir\explorer_command_injector.dll" -Destination "$innoDir\zed_explorer_command_injector.dll" -Force
 }
 
 function BuildRemoteServer {
@@ -159,9 +175,11 @@ function ZipZedAndItsFriendsDebug {
         ".\$CargoOutDir\zed.pdb",
         ".\$CargoOutDir\cli.pdb",
         ".\$CargoOutDir\auto_update_helper.pdb",
-        ".\$CargoOutDir\explorer_command_injector.pdb",
         ".\$CargoOutDir\remote_server.pdb"
     )
+    if ($channel -ne 'dev') {
+        $items += ".\$CargoOutDir\explorer_command_injector.pdb"
+    }
 
     Compress-Archive -Path $items -DestinationPath ".\$CargoOutDir\zed-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip" -Force
 }
@@ -195,6 +213,10 @@ function UploadToSentry {
 }
 
 function MakeAppx {
+    if ($channel -eq 'dev') {
+        Write-Output 'Skipping the upstream AppX explorer extension for Semantic Zed.'
+        return
+    }
     switch ($channel) {
         "stable" {
             $manifestFile = "$env:ZED_WORKSPACE\crates\explorer_command_injector\AppxManifest.xml"
@@ -207,10 +229,17 @@ function MakeAppx {
         }
     }
     Copy-Item -Path "$manifestFile" -Destination "$innoDir\make_appx\AppxManifest.xml"
-    # Add makeAppx.exe to Path
-    $sdk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64"
-    $env:Path += ';' + $sdk
-    makeAppx.exe pack /d "$innoDir\make_appx" /p "$innoDir\zed_explorer_command_injector.appx" /nv
+    # Hosted runners do not all have the same Windows SDK revision, so resolve
+    # MakeAppx rather than assuming one private-runner path.
+    $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+    $makeAppx = Get-ChildItem -Path $sdkRoot -Filter 'makeappx.exe' -Recurse -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1
+    if (-not $makeAppx) {
+        throw 'Could not find makeappx.exe in the installed Windows SDK.'
+    }
+    $makeAppxPath = $makeAppx.FullName
+    & $makeAppxPath pack /d "$innoDir\make_appx" /p "$innoDir\zed_explorer_command_injector.appx" /nv
 }
 
 function SignZedAndItsFriends {
@@ -218,8 +247,24 @@ function SignZedAndItsFriends {
         return
     }
 
-    $files = "$innoDir\Zed.exe,$innoDir\cli.exe,$innoDir\auto_update_helper.exe,$innoDir\zed_explorer_command_injector.dll,$innoDir\zed_explorer_command_injector.appx"
-    & "$innoDir\sign.ps1" $files
+    $files = @(
+        "$innoDir\Zed.exe",
+        "$innoDir\cli.exe",
+        "$innoDir\auto_update_helper.exe"
+    )
+    foreach ($shellExtension in @(
+        "$innoDir\zed_explorer_command_injector.dll",
+        "$innoDir\zed_explorer_command_injector.appx"
+    )) {
+        if (Test-Path -LiteralPath $shellExtension) {
+            $files += $shellExtension
+        }
+    }
+    $pdfium = "$innoDir\resources\pdfium\pdfium.dll"
+    if (Test-Path -LiteralPath $pdfium) {
+        $files += $pdfium
+    }
+    & "$innoDir\sign.ps1" ($files -join ',')
 }
 
 function DownloadAMDGpuServices {
@@ -240,8 +285,12 @@ function DownloadConpty {
 }
 
 function CollectFiles {
-    Move-Item -Path "$innoDir\zed_explorer_command_injector.appx" -Destination "$innoDir\appx\zed_explorer_command_injector.appx" -Force
-    Move-Item -Path "$innoDir\zed_explorer_command_injector.dll" -Destination "$innoDir\appx\zed_explorer_command_injector.dll" -Force
+    if (Test-Path -LiteralPath "$innoDir\zed_explorer_command_injector.appx") {
+        Move-Item -Path "$innoDir\zed_explorer_command_injector.appx" -Destination "$innoDir\appx\zed_explorer_command_injector.appx" -Force
+    }
+    if (Test-Path -LiteralPath "$innoDir\zed_explorer_command_injector.dll") {
+        Move-Item -Path "$innoDir\zed_explorer_command_injector.dll" -Destination "$innoDir\appx\zed_explorer_command_injector.dll" -Force
+    }
     Move-Item -Path "$innoDir\cli.exe" -Destination "$innoDir\bin\zed.exe" -Force
     Move-Item -Path "$innoDir\zed.sh" -Destination "$innoDir\bin\zed" -Force
     Move-Item -Path "$innoDir\auto_update_helper.exe" -Destination "$innoDir\tools\auto_update_helper.exe" -Force
@@ -306,17 +355,17 @@ function BuildInstaller {
             $appAppxFullName = "ZedIndustries.Zed.Nightly_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "dev" {
-            $appId = "{{8357632E-24A4-4F32-BA97-E575B4D1FE5D}"
+            $appId = "{{90777BAE-31AA-429D-9BE2-B4B83B54371A}"
             $appIconName = "app-icon-dev"
-            $appName = "Zed Dev"
-            $appDisplayName = "Zed Dev"
-            $appSetupName = "Zed-$Architecture"
+            $appName = "Semantic Zed"
+            $appDisplayName = "Semantic Zed"
+            $appSetupName = "Semantic-Zed-$Architecture"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Dev-Instance-Mutex"
+            $appMutex = "Semantic-Zed-Instance-Mutex"
             $appExeName = "Zed"
-            $regValueName = "ZedDev"
-            $appUserId = "ZedIndustries.Zed.Dev"
-            $appShellNameShort = "Z&ed Dev"
+            $regValueName = "SemanticZed"
+            $appUserId = "SemanticZed.App"
+            $appShellNameShort = "Semantic &Zed"
             $appAppxFullName = "ZedIndustries.Zed.Dev_1.0.0.0_neutral__japxn1gcva8rg"
         }
         default {
@@ -325,10 +374,16 @@ function BuildInstaller {
         }
     }
 
-    # Windows runner 2022 default has iscc in PATH, https://github.com/actions/runner-images/blob/main/images/windows/Windows2022-Readme.md
-    # Currently, we are using Windows 2022 runner.
-    # Windows runner 2025 doesn't have iscc in PATH for now, https://github.com/actions/runner-images/issues/11228
-    $innoSetupPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+    $innoSetupPath = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+    if (-not $innoSetupPath) {
+        $candidate = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+        if (Test-Path -LiteralPath $candidate) {
+            $innoSetupPath = $candidate
+        }
+    }
+    if (-not $innoSetupPath) {
+        throw 'Could not find Inno Setup 6 ISCC.exe. Install Inno Setup before bundling.'
+    }
 
     $definitions = @{
         "AppId"          = $appId
@@ -343,7 +398,10 @@ function BuildInstaller {
         "ResourcesDir"   = "$innoDir"
         "ShellNameShort" = $appShellNameShort
         "AppUserId"      = $appUserId
-        "Version"        = "$env:RELEASE_VERSION"
+        # Windows VERSIONINFO accepts only numeric quad versions. Cargo keeps
+        # the public SemVer pre-release suffix (for example alpha.1), so map it
+        # to a valid installer version without changing the app's Rust version.
+        "Version"        = (($env:RELEASE_VERSION -replace '^([0-9]+)\.([0-9]+)\.([0-9]+).*$','$1.$2.$3.0'))
         "SourceDir"      = "$env:ZED_WORKSPACE"
         "AppxFullName"   = $appAppxFullName
     }
@@ -401,8 +459,8 @@ if($env:CI) {
 if ($buildSuccess) {
     Write-Output "Build successful"
     if ($Install) {
-        Write-Output "Installing Zed..."
-        Start-Process -FilePath "$env:ZED_WORKSPACE/target/ZedEditorUserSetup-x64-$env:RELEASE_VERSION.exe"
+        Write-Output "Installing Semantic Zed..."
+        Start-Process -FilePath "$env:ZED_WORKSPACE/target/Semantic-Zed-$Architecture.exe"
     }
     exit 0
 }

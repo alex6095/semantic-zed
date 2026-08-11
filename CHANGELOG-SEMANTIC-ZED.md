@@ -8,6 +8,13 @@ upstream application version.
 
 ### Changed
 
+- Added a public, platform-specific release pipeline for macOS Apple Silicon,
+  Windows x86_64, and Linux x86_64. Each package embeds a SHA-256-verified
+  PDFium library and its license notices; CI fails if the package layout is
+  missing that native renderer.
+- Gave Semantic Zed its own application identity, user-data directories,
+  Linux desktop entry, Windows installer name, and CLI name so it can coexist
+  with upstream Zed.
 - Replaced the verbose Overleaf account card with compact native header actions
   and an account popover showing the saved account email, reauthentication, and
   local disconnect.
@@ -30,6 +37,9 @@ upstream application version.
 - Semantic Light sidebar and account popover inspected in the native GPUI app at
   a 296 px sidebar width. A fresh compact-layout Dark/minimum-width screenshot
   remains pending.
+- Shell metadata resolution covers both macOS architectures and Linux GNU/musl
+  targets. Windows, Linux, and macOS package jobs remain release gates until
+  their first GitHub Actions run and clean-machine smoke tests finish.
 
 ## [0.1.0-alpha.1] - 2026-08-12
 
@@ -63,5 +73,6 @@ Source milestone; no notarized public binary has been released.
 ### Release boundary
 
 - Verified locally on macOS arm64 with a development signing identity.
-- Windows/Linux packaging, PDFium distribution review, Apple notarization, and
-  public release artifacts remain pending.
+- Cross-platform package scripts and artifact CI are committed, but the first
+  Windows/Linux CI run, PDFium redistribution review, Apple notarization, and
+  public release tag remain pending.
