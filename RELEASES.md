@@ -21,6 +21,21 @@ aarch64 to pinned platform libraries. Add a runner and artifact entry only
 after that architecture's package and GUI smoke test pass; do not publish an
 unverified architecture merely because the Rust source cross-compiles.
 
+## Source archives are not application packages
+
+GitHub automatically shows a small ZIP/TAR source snapshot on a tag. That is
+useful for building from source, but it cannot launch: it contains neither a
+platform executable nor the native PDF renderer. The executable artifacts
+above are deliberately separate and architecture-specific.
+
+Each executable bundle excludes the source tree, Cargo target directory, test
+fixtures, compiler caches, and development-only diagnostics. It includes only
+the compiled application, its runtime resources, the matching PDFium shared
+library, and required license notices. A full native editor will therefore be
+larger than a source ZIP; the workflow publishes the measured compressed size
+with each release artifact rather than pretending that a runnable desktop app
+is a 20 MB download.
+
 ## Packaging guarantees
 
 - The package scripts download PDFium 7881 at build time, pin its SHA-256,
