@@ -15,7 +15,9 @@ use crate::merge::{MergeResult, desired_change_is_present, merge_text};
 use crate::ot::{diff_to_history_operations, diff_to_sharejs_operations};
 use crate::ownership::{OwnershipError, WorkspaceOwnership};
 use crate::project_model::{EntityKind, ProjectEntity, ProjectModel, ProjectModelError};
-use crate::realtime::{DocumentSnapshot, OverleafRealtimeSession, RealtimeError, RealtimeEvent};
+use crate::realtime::{
+    DocumentSnapshot, OverleafRealtimeSession, RealtimeError, RealtimeEvent, RealtimeEventStream,
+};
 use crate::replica::{ConflictRecord, DocumentRecord, EntityRecord, ReplicaError, ReplicaStore};
 use crate::scan::{
     ScanError, TreeSnapshot, atomic_write, digest_bytes, is_text_document_path, scan_tree,
@@ -520,7 +522,7 @@ impl NativeProjectSync {
         config: NativeProjectConfig,
         identity: Identity,
         events: broadcast::Sender<NativeSyncEvent>,
-    ) -> Result<(Self, broadcast::Receiver<RealtimeEvent>), NativeSyncError> {
+    ) -> Result<(Self, RealtimeEventStream), NativeSyncError> {
         let ownership = WorkspaceOwnership::acquire(&root, &config.project_id)?;
         let realtime = Arc::new(
             OverleafRealtimeSession::connect_and_join(
@@ -532,7 +534,7 @@ impl NativeProjectSync {
         );
         // This receiver exists before the event bridge begins. Keep it through bootstrap so a
         // `reciveNew*` event emitted just after `joinProject` is applied once the actor starts.
-        let realtime_events = realtime.take_startup_events();
+        let realtime_events = realtime.take_startup_events()?;
         let model = ProjectModel::from_project(realtime.project().clone())?;
         let store = ReplicaStore::open(&root, &config.server, &config.project_id)?;
         let mut http = OverleafHttpClient::new(&config.server)?;
@@ -568,7 +570,7 @@ impl NativeProjectSync {
     async fn run(
         &mut self,
         mut commands: mpsc::UnboundedReceiver<NativeCommand>,
-        mut realtime_events: broadcast::Receiver<RealtimeEvent>,
+        mut realtime_events: RealtimeEventStream,
     ) {
         let mut scan_interval = tokio::time::interval(Duration::from_millis(
             self.config.scan_interval_ms.clamp(100, 60_000),
@@ -583,7 +585,7 @@ impl NativeProjectSync {
                 }
                 event = realtime_events.recv() => {
                     match event {
-                        Ok(event) if event.name == "disconnect" => {
+                        Some(event) if event.name == "disconnect" => {
                             self.connection_state = "reconnecting".into();
                             self.emit_status();
                             match self.reconnect().await {
@@ -591,17 +593,12 @@ impl NativeProjectSync {
                                 Err(error) => self.record_error(error),
                             }
                         }
-                        Ok(event) => {
+                        Some(event) => {
                             if let Err(error) = self.handle_realtime_event(event).await {
                                 self.record_error(error);
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            if let Err(error) = self.refresh_all_documents("event-lag").await {
-                                self.record_error(error);
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
+                        None => break,
                     }
                 }
                 _ = scan_interval.tick() => {
@@ -1427,16 +1424,6 @@ impl NativeProjectSync {
         result?;
         if needs_flush {
             self.flush_document(id, "remote-rebase").await?;
-        }
-        Ok(())
-    }
-
-    async fn refresh_all_documents(&mut self, origin: &str) -> Result<(), NativeSyncError> {
-        let ids = self.documents.keys().cloned().collect::<Vec<_>>();
-        for id in ids {
-            if self.documents[&id].state != "conflicted" {
-                self.refresh_document(&id, origin).await?;
-            }
         }
         Ok(())
     }
@@ -2364,7 +2351,7 @@ impl NativeProjectSync {
         Ok(())
     }
 
-    async fn reconnect(&mut self) -> Result<broadcast::Receiver<RealtimeEvent>, NativeSyncError> {
+    async fn reconnect(&mut self) -> Result<RealtimeEventStream, NativeSyncError> {
         let realtime = Arc::new(
             OverleafRealtimeSession::connect_and_join(
                 &self.config.server,
@@ -2375,7 +2362,7 @@ impl NativeProjectSync {
         );
         // As on the first connection, retain all project events emitted while the recovered
         // model is being bootstrapped. This keeps Socket.IO as the sole remote-change path.
-        let realtime_events = realtime.take_startup_events();
+        let realtime_events = realtime.take_startup_events()?;
         let model = ProjectModel::from_project(realtime.project().clone())?;
         let mut removed = self
             .model

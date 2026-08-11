@@ -1,10 +1,11 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::http::Identity;
@@ -23,6 +24,36 @@ pub enum SocketScheme {
 pub struct RealtimeEvent {
     pub name: String,
     pub args: Vec<Value>,
+}
+
+/// The single, lossless stream of events for one realtime session.
+///
+/// The Socket.IO bridge writes to a bounded channel and awaits capacity rather than dropping an
+/// event. During the V2 handshake, events which arrive before `joinProjectResponse` are retained
+/// here and delivered to the sync actor afterwards in their original order.
+pub struct RealtimeEventStream {
+    buffered: VecDeque<RealtimeEvent>,
+    receiver: mpsc::Receiver<RealtimeEvent>,
+}
+
+impl RealtimeEventStream {
+    fn new(receiver: mpsc::Receiver<RealtimeEvent>) -> Self {
+        Self {
+            buffered: VecDeque::new(),
+            receiver,
+        }
+    }
+
+    fn retain_before_join(&mut self, events: VecDeque<RealtimeEvent>) {
+        self.buffered.extend(events);
+    }
+
+    pub async fn recv(&mut self) -> Option<RealtimeEvent> {
+        match self.buffered.pop_front() {
+            Some(event) => Some(event),
+            None => self.receiver.recv().await,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -63,12 +94,11 @@ pub struct OverleafRealtimeSession {
     project_id: String,
     project: Value,
     public_id: Arc<RwLock<Option<String>>>,
-    events: broadcast::Sender<RealtimeEvent>,
-    // Keep a receiver alive before the Socket.IO event bridge starts. `joinProject` gives us a
-    // point-in-time model, but a project event can be emitted immediately afterwards while the
-    // native replica is bootstrapping files. A normal late `subscribe()` would silently start at
-    // the broadcast tail and lose that event.
-    startup_events: Mutex<Option<broadcast::Receiver<RealtimeEvent>>>,
+    // Install the sole event receiver before the Socket.IO bridge starts. `joinProject` gives us
+    // a point-in-time model, but project events can be emitted immediately afterwards while the
+    // native replica is bootstrapping files. This bounded stream applies backpressure instead of
+    // retaining a lossy broadcast tail or adding a reconciliation fallback.
+    startup_events: Mutex<Option<RealtimeEventStream>>,
     event_task: JoinHandle<()>,
     ack_timeout: Duration,
 }
@@ -119,11 +149,10 @@ impl OverleafRealtimeSession {
         let transport = Arc::new(
             SocketIo09Session::connect(server_url, &query, &identity.cookies, ack_timeout).await?,
         );
-        let (events, _) = broadcast::channel(1024);
-        let startup_events = events.subscribe();
-        let mut join_events = events.subscribe();
+        let (event_sender, event_receiver) = mpsc::channel(1024);
+        let mut startup_events = RealtimeEventStream::new(event_receiver);
         let public_id = Arc::new(RwLock::new(None));
-        let event_task = spawn_event_bridge(transport.clone(), events.clone(), public_id.clone());
+        let event_task = spawn_event_bridge(transport.clone(), event_sender, public_id.clone());
 
         let project_result = async {
             match scheme {
@@ -141,31 +170,37 @@ impl OverleafRealtimeSession {
                     .ok_or(RealtimeError::InvalidResponse("v1 joinProject"))?;
                 if !project.get("rootFolder").is_some_and(Value::is_array) {
                     return Err(RealtimeError::InvalidResponse("v1 joinProject"));
-                }
+                    }
                     Ok(project)
                 }
                 SocketScheme::V2 => {
-                let deadline = tokio::time::sleep(ack_timeout);
-                tokio::pin!(deadline);
-                loop {
-                    tokio::select! {
-                        _ = &mut deadline => {
-                            return Err(RealtimeError::JoinProjectTimeout);
-                        }
-                        event = join_events.recv() => {
-                            let event = event.map_err(|_| RealtimeError::EventStreamClosed)?;
-                            if event.name != "joinProjectResponse" {
-                                continue;
+                    let deadline = tokio::time::sleep(ack_timeout);
+                    tokio::pin!(deadline);
+                    let mut events_before_join = VecDeque::new();
+                    let result = loop {
+                        tokio::select! {
+                            _ = &mut deadline => {
+                                break Err(RealtimeError::JoinProjectTimeout);
                             }
-                            let (project, parsed_public_id) = parse_join_project_response(&event.args)
-                                .ok_or(RealtimeError::InvalidResponse("v2 joinProjectResponse"))?;
-                            if let Some(parsed_public_id) = parsed_public_id {
-                                *public_id.write().unwrap() = Some(parsed_public_id);
-                            }
+                            event = startup_events.recv() => {
+                                let Some(event) = event else {
+                                    break Err(RealtimeError::EventStreamClosed);
+                                };
+                                if event.name != "joinProjectResponse" {
+                                    events_before_join.push_back(event);
+                                    continue;
+                                }
+                                let (project, parsed_public_id) = parse_join_project_response(&event.args)
+                                    .ok_or(RealtimeError::InvalidResponse("v2 joinProjectResponse"))?;
+                                if let Some(parsed_public_id) = parsed_public_id {
+                                    *public_id.write().unwrap() = Some(parsed_public_id);
+                                }
                                 break Ok(project);
                             }
                         }
-                    }
+                    };
+                    startup_events.retain_before_join(events_before_join);
+                    result
                 }
             }
         }
@@ -185,7 +220,6 @@ impl OverleafRealtimeSession {
             project_id: project_id.into(),
             project,
             public_id,
-            events,
             startup_events: Mutex::new(Some(startup_events)),
             event_task,
             ack_timeout,
@@ -208,21 +242,14 @@ impl OverleafRealtimeSession {
         self.public_id.read().unwrap().clone()
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<RealtimeEvent> {
-        self.events.subscribe()
-    }
-
     /// Returns the receiver that was installed before the Socket.IO bridge began receiving.
-    ///
-    /// It is consumed once by the native sync actor during connection/bootstrap. Subsequent
-    /// callers receive a normal live subscription, which is the least surprising behaviour for
-    /// an already-running session.
-    pub fn take_startup_events(&self) -> broadcast::Receiver<RealtimeEvent> {
+    /// It is consumed exactly once by the native sync actor during connection/bootstrap.
+    pub fn take_startup_events(&self) -> Result<RealtimeEventStream, RealtimeError> {
         self.startup_events
             .lock()
             .unwrap()
             .take()
-            .unwrap_or_else(|| self.events.subscribe())
+            .ok_or(RealtimeError::EventStreamClosed)
     }
 
     pub async fn join_document(
@@ -420,7 +447,7 @@ async fn emit_overleaf_ack(
 
 fn spawn_event_bridge(
     transport: Arc<SocketIo09Session>,
-    events: broadcast::Sender<RealtimeEvent>,
+    events: mpsc::Sender<RealtimeEvent>,
     public_id: Arc<RwLock<Option<String>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -431,12 +458,16 @@ fn spawn_event_bridge(
             {
                 *public_id.write().unwrap() = Some(id.into());
             }
-            let _ = events.send(RealtimeEvent { name, args });
+            if events.send(RealtimeEvent { name, args }).await.is_err() {
+                return;
+            }
         }
-        let _ = events.send(RealtimeEvent {
-            name: "disconnect".into(),
-            args: Vec::new(),
-        });
+        let _ = events
+            .send(RealtimeEvent {
+                name: "disconnect".into(),
+                args: Vec::new(),
+            })
+            .await;
     })
 }
 
@@ -553,6 +584,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_stream_backpressures_without_dropping_events() {
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(RealtimeEvent {
+                name: "first".into(),
+                args: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let second = sender.send(RealtimeEvent {
+            name: "second".into(),
+            args: Vec::new(),
+        });
+        tokio::pin!(second);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err()
+        );
+
+        let mut events = RealtimeEventStream::new(receiver);
+        assert_eq!(events.recv().await.unwrap().name, "first");
+        second.await.unwrap();
+        assert_eq!(events.recv().await.unwrap().name, "second");
+    }
+
+    #[tokio::test]
     async fn retains_file_events_emitted_immediately_after_join_project() {
         let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
         let url = format!("http://{}/", listener.local_addr().unwrap());
@@ -633,7 +692,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut events = session.take_startup_events();
+        let mut events = session.take_startup_events().unwrap();
         let event = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let event = events.recv().await.unwrap();
@@ -702,6 +761,20 @@ mod tests {
             websocket
                 .send(Message::Text(
                     encode_packet(&Packet::event(
+                        "reciveNewFile",
+                        vec![
+                            json!("root-folder"),
+                            json!({ "_id": "figure-before-join", "name": "figure.png" }),
+                        ],
+                    ))
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            websocket
+                .send(Message::Text(
+                    encode_packet(&Packet::event(
                         "joinProjectResponse",
                         vec![json!({
                             "project": { "name": "Native Paper", "rootFolder": [] },
@@ -759,6 +832,10 @@ mod tests {
         assert_eq!(session.scheme(), SocketScheme::V2);
         assert_eq!(session.public_id().as_deref(), Some("native-client"));
         assert_eq!(session.project()["name"], json!("Native Paper"));
+        let mut events = session.take_startup_events().unwrap();
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.name, "reciveNewFile");
+        assert_eq!(event.args[1]["_id"], json!("figure-before-join"));
         let snapshot = session.join_document("doc-1", None, None).await.unwrap();
         assert_eq!(snapshot.version, 7);
         assert_eq!(snapshot.text, "\\documentclass{article}\nNative realtime");
