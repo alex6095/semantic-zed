@@ -29,10 +29,19 @@ pub struct SelectionsCollection {
     /// The non-pending, non-overlapping selections.
     /// The [SelectionsCollection::pending] selection could possibly overlap these
     disjoint: Arc<[Selection<Anchor>]>,
+    resolved_disjoint: Option<ResolvedDisjoint>,
     /// A pending selection, such as when the mouse is being dragged
     pending: Option<PendingSelection>,
     select_mode: SelectMode,
     is_extending: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedDisjoint {
+    disjoint_ptr: usize,
+    edit_count: usize,
+    offsets: Arc<[Selection<MultiBufferOffset>]>,
+    points: Arc<[Selection<Point>]>,
 }
 
 impl SelectionsCollection {
@@ -41,6 +50,7 @@ impl SelectionsCollection {
             next_selection_id: 1,
             line_mode: false,
             disjoint: Arc::default(),
+            resolved_disjoint: None,
             pending: Some(PendingSelection {
                 selection: Selection {
                     id: 0,
@@ -60,7 +70,40 @@ impl SelectionsCollection {
         self.next_selection_id = other.next_selection_id;
         self.line_mode = other.line_mode;
         self.disjoint = other.disjoint.clone();
+        self.resolved_disjoint.clone_from(&other.resolved_disjoint);
         self.pending.clone_from(&other.pending);
+    }
+
+    fn resolved_disjoint(&self, snapshot: &MultiBufferSnapshot) -> Option<&ResolvedDisjoint> {
+        let resolved = self.resolved_disjoint.as_ref()?;
+        let disjoint_ptr = Arc::as_ptr(&self.disjoint) as *const Selection<Anchor> as usize;
+        (resolved.disjoint_ptr == disjoint_ptr
+            && resolved.edit_count == snapshot.edit_count()
+            && snapshot.as_singleton_without_transforms().is_some())
+        .then_some(resolved)
+    }
+
+    pub fn disjoint_offsets(
+        &self,
+        snapshot: &MultiBufferSnapshot,
+    ) -> Option<Arc<[Selection<MultiBufferOffset>]>> {
+        self.resolved_disjoint(snapshot)
+            .map(|resolved| resolved.offsets.clone())
+    }
+
+    pub fn disjoint_points(
+        &self,
+        snapshot: &MultiBufferSnapshot,
+    ) -> Option<Arc<[Selection<Point>]>> {
+        self.resolved_disjoint(snapshot)
+            .map(|resolved| resolved.points.clone())
+    }
+
+    fn cached_disjoint_points(&self, map: &DisplaySnapshot) -> Option<Arc<[Selection<Point>]>> {
+        if map.has_collapsed_content() {
+            return None;
+        }
+        self.disjoint_points(map.buffer_snapshot())
     }
 
     pub fn count(&self) -> usize {
@@ -133,8 +176,15 @@ impl SelectionsCollection {
     where
         D: 'a + MultiBufferDimension + Sub + AddAssign<<D as Sub>::Output> + Ord,
     {
-        let mut disjoint =
-            resolve_selections_wrapping_blocks::<D, _>(self.disjoint.iter(), snapshot).peekable();
+        let mut disjoint = if let Some(points) = self.cached_disjoint_points(snapshot) {
+            Either::Left(convert_point_selections::<D>(points, snapshot))
+        } else {
+            Either::Right(resolve_selections_wrapping_blocks::<D, _>(
+                self.disjoint.iter(),
+                snapshot,
+            ))
+        }
+        .peekable();
         let mut pending_opt = self.pending::<D>(snapshot);
         iter::from_fn(move || {
             if let Some(pending) = pending_opt.as_mut() {
@@ -223,6 +273,11 @@ impl SelectionsCollection {
         let buffer = snapshot.buffer_snapshot();
         let start_row = range.start.to_point(buffer).row;
         let end_row = range.end.to_point(buffer).row;
+        if let Some(points) = self.cached_disjoint_points(snapshot) {
+            let start_ix = points.partition_point(|probe| probe.end.row < start_row);
+            let end_ix = points.partition_point(|probe| probe.start.row <= end_row);
+            return convert_point_selections(points[start_ix..end_ix].into(), snapshot).collect();
+        }
         let start_ix = self
             .disjoint
             .partition_point(|probe| probe.end.to_point(buffer).row < start_row);
@@ -252,8 +307,15 @@ impl SelectionsCollection {
 
     pub fn all_display(&self, snapshot: &DisplaySnapshot) -> Vec<Selection<DisplayPoint>> {
         let disjoint_anchors = &self.disjoint;
-        let mut disjoint =
-            resolve_selections_display(disjoint_anchors.iter(), &snapshot).peekable();
+        let mut disjoint = if let Some(points) = self.cached_disjoint_points(snapshot) {
+            Either::Left(resolve_point_selections_display(points, snapshot))
+        } else {
+            Either::Right(resolve_selections_display(
+                disjoint_anchors.iter(),
+                &snapshot,
+            ))
+        }
+        .peekable();
         let mut pending_opt = resolve_selections_display(self.pending_anchor(), &snapshot).next();
         iter::from_fn(move || {
             if let Some(pending) = pending_opt.as_mut() {
@@ -667,10 +729,12 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
 
     pub fn clear_disjoint(&mut self) {
         self.collection.disjoint = Arc::default();
+        self.collection.resolved_disjoint = None;
     }
 
     pub fn delete(&mut self, selection_id: usize) {
         let mut changed = false;
+        self.collection.resolved_disjoint = None;
         self.collection.disjoint = self
             .disjoint
             .iter()
@@ -723,6 +787,7 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
         } else {
             self.collection.disjoint = filtered_selections;
         }
+        self.collection.resolved_disjoint = None;
 
         self.selections_changed |= changed;
     }
@@ -767,6 +832,7 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
         if let Some(pending) = self.collection.pending.take() {
             if self.disjoint.is_empty() {
                 self.collection.disjoint = Arc::from([pending.selection]);
+                self.collection.resolved_disjoint = None;
             }
             self.selections_changed = true;
             return true;
@@ -775,6 +841,7 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
         let mut oldest = self.oldest_anchor().clone();
         if self.count() > 1 {
             self.collection.disjoint = Arc::from([oldest]);
+            self.collection.resolved_disjoint = None;
             self.selections_changed = true;
             return true;
         }
@@ -784,6 +851,7 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
             oldest.start = head;
             oldest.end = head;
             self.collection.disjoint = Arc::from([oldest]);
+            self.collection.resolved_disjoint = None;
             self.selections_changed = true;
             return true;
         }
@@ -846,8 +914,9 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
             }
         });
 
-        let mut converter = self.snapshot.buffer_snapshot().anchor_converter();
-        self.collection.disjoint = Arc::from_iter(selections.into_iter().map(|selection| {
+        let buffer_snapshot = self.snapshot.buffer_snapshot();
+        let mut converter = buffer_snapshot.anchor_converter();
+        self.collection.disjoint = Arc::from_iter(selections.iter().map(|selection| {
             let end_bias = if selection.start == selection.end {
                 Bias::Right
             } else {
@@ -861,9 +930,44 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
                 goal: selection.goal,
             }
         }));
+        self.collection.resolved_disjoint =
+            Self::resolve_disjoint(buffer_snapshot, &self.collection.disjoint, selections);
         self.collection.pending = None;
         self.collection.select_mode = SelectMode::Character;
         self.selections_changed = true;
+    }
+
+    fn resolve_disjoint(
+        snapshot: &MultiBufferSnapshot,
+        disjoint: &Arc<[Selection<Anchor>]>,
+        selections: Vec<Selection<MultiBufferOffset>>,
+    ) -> Option<ResolvedDisjoint> {
+        let buffer = snapshot.as_singleton_without_transforms()?;
+        let mut boundary = buffer.as_rope().char_boundary_converter();
+        let aligned = selections.iter().all(|selection| {
+            boundary.round(selection.start.0, Bias::Left) == selection.start.0
+                && boundary.round(selection.end.0, Bias::Left) == selection.end.0
+        });
+        if !aligned {
+            return None;
+        }
+        let mut offset_to_point = buffer.as_rope().offset_to_point_converter();
+        let points = selections
+            .iter()
+            .map(|selection| Selection {
+                id: selection.id,
+                start: offset_to_point.map(selection.start.0),
+                end: offset_to_point.map(selection.end.0),
+                reversed: selection.reversed,
+                goal: selection.goal,
+            })
+            .collect();
+        Some(ResolvedDisjoint {
+            disjoint_ptr: Arc::as_ptr(disjoint) as *const Selection<Anchor> as usize,
+            edit_count: snapshot.edit_count(),
+            offsets: selections.into(),
+            points,
+        })
     }
 
     pub fn select_anchors(&mut self, selections: Vec<Selection<Anchor>>) {
@@ -1300,6 +1404,64 @@ where
     })
 }
 
+fn convert_point_selections<'a, D>(
+    points: Arc<[Selection<Point>]>,
+    map: &'a DisplaySnapshot,
+) -> impl 'a + Iterator<Item = Selection<D>>
+where
+    D: MultiBufferDimension + Sub + AddAssign<<D as Sub>::Output> + Ord,
+{
+    let mut converted_endpoints = map.buffer_snapshot().dimensions_from_points::<D>({
+        let points = points.clone();
+        (0..points.len() * 2).map(move |ix| {
+            let selection = &points[ix / 2];
+            if ix % 2 == 0 {
+                selection.start
+            } else {
+                selection.end
+            }
+        })
+    });
+    (0..points.len()).map(move |ix| {
+        let selection = &points[ix];
+        let start = converted_endpoints.next().unwrap();
+        let end = converted_endpoints.next().unwrap();
+        Selection {
+            id: selection.id,
+            start,
+            end,
+            reversed: selection.reversed,
+            goal: selection.goal,
+        }
+    })
+}
+
+fn resolve_point_selections_display<'a>(
+    points: Arc<[Selection<Point>]>,
+    map: &'a DisplaySnapshot,
+) -> impl 'a + Iterator<Item = Selection<DisplayPoint>> {
+    let mut converter = map.point_to_display_point_converter();
+    (0..points.len()).map(move |ix| {
+        let selection = &points[ix];
+        let display_start = converter.map(selection.start, Bias::Left);
+        let display_end = converter.map(
+            selection.end,
+            if selection.start == selection.end {
+                Bias::Right
+            } else {
+                Bias::Left
+            },
+        );
+        Selection {
+            id: selection.id,
+            start: display_start,
+            end: display_end,
+            reversed: selection.reversed,
+            goal: selection.goal,
+        }
+    })
+}
+
 fn coalesce_selections<D: Ord + fmt::Debug + Copy>(
     selections: impl Iterator<Item = Selection<D>>,
 ) -> impl Iterator<Item = Selection<D>> {
@@ -1567,6 +1729,82 @@ mod tests {
         )
         .collect::<Vec<_>>();
         assert_eq!(fast_offsets, slow_offsets);
+    }
+
+    #[gpui::test(iterations = 20)]
+    fn cached_selection_resolution_matches_anchor_resolution(
+        cx: &mut gpui::TestAppContext,
+        mut rng: StdRng,
+    ) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            crate::init(cx);
+        });
+
+        let text = random_text(&mut rng);
+        let buffer = cx.update(|cx| MultiBuffer::build_simple(&text, cx));
+        let display_map = cx.new(|cx| {
+            DisplayMap::new(
+                buffer.clone(),
+                test_font(),
+                px(14.),
+                Some(px(rng.random_range(80.0..=180.0))),
+                1,
+                1,
+                FoldPlaceholder::test(),
+                DiagnosticSeverity::Warning,
+                cx,
+            )
+        });
+        let snapshot = display_map.update(cx, |map, cx| map.snapshot(cx));
+        let buffer_snapshot = snapshot.buffer_snapshot();
+
+        let mut ranges = Vec::new();
+        let mut offset = 0;
+        for _ in 0..rng.random_range(1..32) {
+            if offset > text.len() {
+                break;
+            }
+            let start = buffer_snapshot.clip_offset(
+                MultiBufferOffset(rng.random_range(offset..=text.len())),
+                Bias::Left,
+            );
+            let end = buffer_snapshot.clip_offset(
+                MultiBufferOffset(rng.random_range(start.0..=text.len())),
+                Bias::Right,
+            );
+            ranges.push(start..end);
+            offset = end.0.saturating_add(rng.random_range(0..=4));
+        }
+
+        let mut collection = SelectionsCollection::new();
+        collection.change_with(&snapshot, |mutable| {
+            mutable.select_ranges(ranges);
+        });
+        assert!(
+            collection.resolved_disjoint.is_some(),
+            "aligned singleton selections should seed the resolved cache"
+        );
+
+        let cached_points = collection.all::<Point>(&snapshot);
+        let cached_offsets = collection.all::<MultiBufferOffset>(&snapshot);
+        let cached_display = collection.all_display(&snapshot);
+        let range = buffer_snapshot.anchor_before(MultiBufferOffset(0))
+            ..buffer_snapshot.anchor_before(MultiBufferOffset(text.len() / 2));
+        let cached_in_rows = collection.disjoint_in_row_range::<Point>(range.clone(), &snapshot);
+
+        collection.resolved_disjoint = None;
+        assert_eq!(cached_points, collection.all::<Point>(&snapshot));
+        assert_eq!(
+            cached_offsets,
+            collection.all::<MultiBufferOffset>(&snapshot)
+        );
+        assert_eq!(cached_display, collection.all_display(&snapshot));
+        assert_eq!(
+            cached_in_rows,
+            collection.disjoint_in_row_range::<Point>(range, &snapshot)
+        );
     }
 
     fn random_text(rng: &mut StdRng) -> String {

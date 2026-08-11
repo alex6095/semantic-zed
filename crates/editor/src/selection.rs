@@ -1704,23 +1704,31 @@ impl Editor {
 
         let selections = &self.selections.disjoint_anchors_arc();
         if local && let Some(buffer_snapshot) = buffer.as_singleton() {
-            let mut points = buffer_snapshot.summaries_for_anchors::<Point, _>(
-                selections.iter().flat_map(|s| {
-                    let range = s.range();
-                    [
-                        range.start.text_anchor_in(buffer_snapshot),
-                        range.end.text_anchor_in(buffer_snapshot),
-                    ]
-                }),
-            );
-            let inmemory_selections = selections
-                .iter()
-                .map(|_| {
-                    let start = points.next().unwrap();
-                    let end = points.next().unwrap();
-                    start..end
-                })
-                .collect();
+            let inmemory_selections =
+                if let Some(cached_points) = self.selections.disjoint_points(buffer) {
+                    cached_points
+                        .iter()
+                        .map(|selection| selection.start..selection.end)
+                        .collect()
+                } else {
+                    let mut points = buffer_snapshot.summaries_for_anchors::<Point, _>(
+                        selections.iter().flat_map(|s| {
+                            let range = s.range();
+                            [
+                                range.start.text_anchor_in(buffer_snapshot),
+                                range.end.text_anchor_in(buffer_snapshot),
+                            ]
+                        }),
+                    );
+                    selections
+                        .iter()
+                        .map(|_| {
+                            let start = points.next().unwrap();
+                            let end = points.next().unwrap();
+                            start..end
+                        })
+                        .collect()
+                };
             self.update_restoration_data(cx, |data| {
                 data.selections = inmemory_selections;
             });
@@ -1730,21 +1738,30 @@ impl Editor {
                 && let Some(workspace_id) = self.workspace_serialization_id(cx)
             {
                 let snapshot = self.buffer().read(cx).snapshot(cx);
+                let cached_offsets = self.selections.disjoint_offsets(&snapshot);
                 let selections = selections.clone();
                 let background_executor = cx.background_executor().clone();
                 let editor_id = cx.entity().entity_id().as_u64() as ItemId;
                 let db = EditorDb::global(cx);
                 self.serialize_selections = cx.background_spawn(async move {
                     background_executor.timer(SERIALIZATION_THROTTLE_TIME).await;
-                    let offsets = snapshot.summaries_for_anchors::<MultiBufferOffset, _>(
-                        selections
+                    let db_selections = match cached_offsets {
+                        Some(cached_offsets) => cached_offsets
                             .iter()
-                            .flat_map(|selection| [&selection.start, &selection.end]),
-                    );
-                    let db_selections = offsets
-                        .chunks_exact(2)
-                        .map(|offsets| (offsets[0].0, offsets[1].0))
-                        .collect();
+                            .map(|selection| (selection.start.0, selection.end.0))
+                            .collect(),
+                        None => {
+                            let offsets = snapshot.summaries_for_anchors::<MultiBufferOffset, _>(
+                                selections
+                                    .iter()
+                                    .flat_map(|selection| [&selection.start, &selection.end]),
+                            );
+                            offsets
+                                .chunks_exact(2)
+                                .map(|offsets| (offsets[0].0, offsets[1].0))
+                                .collect()
+                        }
+                    };
 
                     db.save_editor_selections(editor_id, workspace_id, db_selections)
                         .await
