@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,11 @@ pub struct OverleafRealtimeSession {
     project: Value,
     public_id: Arc<RwLock<Option<String>>>,
     events: broadcast::Sender<RealtimeEvent>,
+    // Keep a receiver alive before the Socket.IO event bridge starts. `joinProject` gives us a
+    // point-in-time model, but a project event can be emitted immediately afterwards while the
+    // native replica is bootstrapping files. A normal late `subscribe()` would silently start at
+    // the broadcast tail and lose that event.
+    startup_events: Mutex<Option<broadcast::Receiver<RealtimeEvent>>>,
     event_task: JoinHandle<()>,
     ack_timeout: Duration,
 }
@@ -114,7 +119,8 @@ impl OverleafRealtimeSession {
         let transport = Arc::new(
             SocketIo09Session::connect(server_url, &query, &identity.cookies, ack_timeout).await?,
         );
-        let (events, _) = broadcast::channel(256);
+        let (events, _) = broadcast::channel(1024);
+        let startup_events = events.subscribe();
         let mut join_events = events.subscribe();
         let public_id = Arc::new(RwLock::new(None));
         let event_task = spawn_event_bridge(transport.clone(), events.clone(), public_id.clone());
@@ -180,6 +186,7 @@ impl OverleafRealtimeSession {
             project,
             public_id,
             events,
+            startup_events: Mutex::new(Some(startup_events)),
             event_task,
             ack_timeout,
         })
@@ -203,6 +210,19 @@ impl OverleafRealtimeSession {
 
     pub fn subscribe(&self) -> broadcast::Receiver<RealtimeEvent> {
         self.events.subscribe()
+    }
+
+    /// Returns the receiver that was installed before the Socket.IO bridge began receiving.
+    ///
+    /// It is consumed once by the native sync actor during connection/bootstrap. Subsequent
+    /// callers receive a normal live subscription, which is the least surprising behaviour for
+    /// an already-running session.
+    pub fn take_startup_events(&self) -> broadcast::Receiver<RealtimeEvent> {
+        self.startup_events
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| self.events.subscribe())
     }
 
     pub async fn join_document(
@@ -530,6 +550,104 @@ mod tests {
             parse_join_project_response(&[json!([project.clone(), "client-2"])]),
             Some((project, Some("client-2".into())))
         );
+    }
+
+    #[tokio::test]
+    async fn retains_file_events_emitted_immediately_after_join_project() {
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server_listener = listener.clone();
+        let server = tokio::spawn(async move {
+            serve_handshake(&server_listener, "native-session").await;
+            let (stream, _) = server_listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            websocket
+                .send(Message::Text(
+                    encode_packet(&Packet::new(PacketType::Connect))
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+
+            let join = loop {
+                let message = websocket.next().await.unwrap().unwrap();
+                let Message::Text(payload) = message else {
+                    continue;
+                };
+                let packet = decode_payload(&payload).unwrap().remove(0);
+                if packet.event.as_deref() == Some("joinProject") {
+                    break packet;
+                }
+            };
+            let mut ack = Packet::new(PacketType::Ack);
+            ack.ack_id = join.id;
+            ack.args = vec![Value::Null, json!({ "rootFolder": [] })];
+            websocket
+                .send(Message::Text(encode_packet(&ack).unwrap().into()))
+                .await
+                .unwrap();
+            // This is the exact hosted shape: parent folder ID followed by the new file entity.
+            // Send it before `connect_and_join` returns to verify that bootstrap cannot lose it.
+            websocket
+                .send(Message::Text(
+                    encode_packet(&Packet::event(
+                        "reciveNewFile",
+                        vec![
+                            json!("root-folder"),
+                            json!({ "_id": "figure-1", "name": "figure.png" }),
+                            json!("upload"),
+                        ],
+                    ))
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            while let Some(message) = websocket.next().await {
+                let Ok(Message::Text(payload)) = message else {
+                    continue;
+                };
+                if decode_payload(&payload)
+                    .unwrap()
+                    .iter()
+                    .any(|packet| packet.packet_type == PacketType::Disconnect)
+                {
+                    break;
+                }
+            }
+        });
+
+        let identity = Identity {
+            cookies: "session=active".into(),
+            csrf_token: "csrf".into(),
+            user_id: "user-1".into(),
+            user_email: "researcher@example.com".into(),
+        };
+        let session = OverleafRealtimeSession::connect_and_join_with_timeout(
+            &url,
+            &identity,
+            "paper-1",
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let mut events = session.take_startup_events();
+        let event = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.name == "reciveNewFile" {
+                    return event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(event.args[0], json!("root-folder"));
+        assert_eq!(event.args[1]["_id"], json!("figure-1"));
+        session.disconnect();
+        server.await.unwrap();
     }
 
     #[tokio::test]
