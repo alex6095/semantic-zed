@@ -87,6 +87,11 @@ jobs:
     name: Windows x86_64 installer
     runs-on: windows-2022
     timeout-minutes: 120
+    # Some transitive Git dependencies contain deeply nested fixtures. Keeping
+    # Cargo's checkout root short makes this installer reproducible on Windows.
+    env:
+      CARGO_HOME: C:\c
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
     steps:
       - name: Check out Semantic Zed
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
