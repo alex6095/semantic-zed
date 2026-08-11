@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,7 +14,9 @@ use crate::http::{HttpError, Identity, OverleafHttpClient};
 use crate::merge::{MergeResult, desired_change_is_present, merge_text};
 use crate::ot::{diff_to_history_operations, diff_to_sharejs_operations};
 use crate::ownership::{OwnershipError, WorkspaceOwnership};
-use crate::project_model::{EntityKind, ProjectEntity, ProjectModel, ProjectModelError};
+use crate::project_model::{
+    EntityKind, ProjectEntity, ProjectModel, ProjectModelError, normalize_relative_path,
+};
 use crate::realtime::{DocumentSnapshot, OverleafRealtimeSession, RealtimeError, RealtimeEvent};
 use crate::replica::{ConflictRecord, DocumentRecord, EntityRecord, ReplicaError, ReplicaStore};
 use crate::scan::{
@@ -23,6 +25,10 @@ use crate::scan::{
 
 const DEFAULT_SERVER: &str = "https://www.overleaf.com/";
 const CONFIRM_DELAYS: [u64; 7] = [0, 30, 60, 120, 250, 500, 1_000];
+// Hosted Overleaf does not reliably broadcast `reciveNew*` for files uploaded through
+// its browser file picker. Keep realtime events as the fast path, then cheaply compare
+// the authoritative entity tree as a safety net for missed create/move/remove events.
+const REMOTE_TREE_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -572,6 +578,11 @@ impl NativeProjectSync {
         ));
         scan_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let _ = scan_interval.tick().await;
+        let mut remote_tree_interval = tokio::time::interval(REMOTE_TREE_RECONCILE_INTERVAL);
+        remote_tree_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // `interval` fires immediately on its first tick. Connection/bootstrap already gave
+        // us a full model, so consume that tick and start checking after the configured delay.
+        let _ = remote_tree_interval.tick().await;
         loop {
             tokio::select! {
                 command = commands.recv() => {
@@ -609,6 +620,21 @@ impl NativeProjectSync {
                         }
                     } else if let Err(error) = self.scan_documents("filesystem").await {
                         self.record_error(error);
+                    }
+                }
+                _ = remote_tree_interval.tick(), if self.connection_state == "live" => {
+                    match self.remote_tree_drifted().await {
+                        Ok(true) => {
+                            // Reconnect uses the project model as the authoritative source,
+                            // downloads newly discovered binaries, and preserves the existing
+                            // OT/document reconciliation rules.
+                            match self.reconnect().await {
+                                Ok(receiver) => realtime_events = receiver,
+                                Err(error) => self.record_error(error),
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(error) => self.record_error(error),
                     }
                 }
             }
@@ -1436,6 +1462,21 @@ impl NativeProjectSync {
             }
         }
         Ok(())
+    }
+
+    async fn remote_tree_drifted(&mut self) -> Result<bool, NativeSyncError> {
+        // Never reconcile a project model while local OT/binary work is still in flight: the
+        // HTTP entity list can briefly lag an acknowledged local mutation.
+        if self.documents.values().any(|document| document.pending)
+            || !self.store.state().operations.is_empty()
+        {
+            return Ok(false);
+        }
+        let entities = self
+            .http
+            .get_project_entities(&self.config.project_id)
+            .await?;
+        remote_entity_tree_drifted(&self.model, &entities)
     }
 
     async fn scan_documents(&mut self, origin: &str) -> Result<(), NativeSyncError> {
@@ -2581,6 +2622,43 @@ fn client_id(value: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+/// Returns whether the cheap HTTP entity listing disagrees with the realtime project model.
+///
+/// The endpoint supplies paths with a leading slash while `ProjectModel` deliberately stores
+/// safe replica-relative paths. Unknown entity types are ignored so a hosted deployment can add
+/// metadata-only rows without forcing a needless reconnect.
+fn remote_entity_tree_drifted(
+    model: &ProjectModel,
+    remote_entities: &[Value],
+) -> Result<bool, NativeSyncError> {
+    let remote = remote_entities
+        .iter()
+        .filter_map(remote_entity_signature)
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let local = model
+        .all()
+        .filter(|entity| entity.parent_id.is_some())
+        .map(|entity| (entity.kind.route_name().to_owned(), entity.path.clone()))
+        .collect::<BTreeSet<_>>();
+    Ok(remote != local)
+}
+
+fn remote_entity_signature(entity: &Value) -> Option<Result<(String, String), NativeSyncError>> {
+    let kind = match entity.get("type").and_then(Value::as_str) {
+        Some("doc") | Some("document") => "doc",
+        Some("file") => "file",
+        Some("folder") => "folder",
+        _ => return None,
+    };
+    let path = entity.get("path").and_then(Value::as_str)?;
+    // The entity-list endpoint uses absolute-looking project paths (`/main.tex`), not
+    // filesystem paths. Remove only that transport prefix before applying the normal replica
+    // traversal guard; a malformed path must fail closed rather than silently match local work.
+    let path = normalize_relative_path(path.strip_prefix('/').unwrap_or(path))
+        .map_err(NativeSyncError::from);
+    Some(path.map(|path| (kind.to_owned(), path)))
+}
+
 fn first_non_bmp_position(text: &str) -> Option<(char, usize, usize)> {
     let mut row = 1;
     let mut column = 1;
@@ -2809,6 +2887,59 @@ mod tests {
         assert_eq!(presence.document_path, "main.tex");
         assert_eq!(presence.name, "Alex Lee");
         assert_eq!((presence.row, presence.column), (11, 24));
+    }
+
+    #[test]
+    fn detects_a_browser_file_picker_upload_missing_from_the_realtime_model() {
+        let model = ProjectModel::from_project(json!({
+            "rootFolder": [{
+                "_id": "root",
+                "docs": [{ "_id": "doc-1", "name": "main.tex" }],
+                "fileRefs": [],
+                "folders": [{
+                    "_id": "figures",
+                    "name": "figures",
+                    "docs": [],
+                    "fileRefs": [{ "_id": "plot", "name": "plot.png" }],
+                    "folders": []
+                }]
+            }]
+        }))
+        .unwrap();
+        let matching = vec![
+            json!({ "path": "/main.tex", "type": "doc" }),
+            json!({ "path": "/figures", "type": "folder" }),
+            json!({ "path": "/figures/plot.png", "type": "file" }),
+        ];
+        assert!(!remote_entity_tree_drifted(&model, &matching).unwrap());
+
+        let mut uploaded_in_browser = matching;
+        uploaded_in_browser.push(json!({ "path": "/IMG_8034.JPG", "type": "file" }));
+        assert!(remote_entity_tree_drifted(&model, &uploaded_in_browser).unwrap());
+    }
+
+    #[test]
+    fn ignores_unknown_remote_entity_rows_but_rejects_escaping_paths() {
+        let model = ProjectModel::from_project(json!({
+            "rootFolder": [{
+                "_id": "root", "docs": [], "fileRefs": [], "folders": []
+            }]
+        }))
+        .unwrap();
+        assert!(
+            !remote_entity_tree_drifted(
+                &model,
+                &[json!({ "path": "/metadata", "type": "metadata" })],
+            )
+            .unwrap()
+        );
+        assert!(
+            remote_entity_tree_drifted(
+                &model,
+                &[json!({ "path": "/../../outside", "type": "file" })],
+            )
+            .is_err()
+        );
     }
 
     #[test]
