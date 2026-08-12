@@ -153,6 +153,9 @@ jobs:
       - name: Create or update the prerelease
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job deliberately downloads only artifacts, so it has no .git
+          # checkout from which gh can infer a repository. Name it explicitly.
+          GH_REPO: ${{ github.repository }}
         run: |
           tag="${GITHUB_REF_NAME}"
           title="Semantic Zed ${tag#semantic-zed-v}"
