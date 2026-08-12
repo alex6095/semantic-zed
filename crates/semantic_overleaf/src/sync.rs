@@ -2847,4 +2847,29 @@ mod tests {
         assert!(needs_materialization_write(Some("older text"), "same text"));
         assert!(needs_materialization_write(None, "same text"));
     }
+
+    /// Manual production diagnostic for the full Rust actor: credential load,
+    /// Socket.IO bootstrap, WebSocket upgrade, project join, and clean stop.
+    /// The workspace path is supplied only by the caller and never stored in
+    /// the test suite.
+    #[tokio::test]
+    #[ignore = "requires a locally authenticated Overleaf replica path"]
+    async fn live_native_sync_actor_smoke() {
+        let root = std::env::var("SEMANTIC_ZED_OVERLEAF_LIVE_ROOT")
+            .expect("set SEMANTIC_ZED_OVERLEAF_LIVE_ROOT to an existing local replica");
+        let handle = NativeSyncHandle::start_from_root(root)
+            .await
+            .expect("start native Overleaf sync actor");
+        let status = handle.status().await.expect("read native sync status");
+        handle.stop().await.expect("stop native sync actor");
+
+        assert!(
+            status.connected,
+            "native sync actor did not reach live state"
+        );
+        assert_eq!(
+            status.documents.pending, 0,
+            "native sync actor retained pending work"
+        );
+    }
 }

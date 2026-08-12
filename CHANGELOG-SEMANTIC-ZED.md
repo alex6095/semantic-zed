@@ -30,6 +30,13 @@ upstream application version.
   line so narrow sidebars no longer clip `Owner` as `wner`.
 - Made the development build runner stop only this checkout's exact app bundle
   and resolve Zed's final child process before recording a successful PID.
+- Reauthentication now drives the app-owned Chromium page explicitly to
+  Overleaf and skips Arc's incompatible isolated-CDP launcher on macOS; other
+  supported default browsers retain first priority.
+- Made the native Socket.IO 0.9 bootstrap use Zed's platform TLS/HTTP/1.1
+  transport and carry the hosted load-balancer affinity cookie into the WSS
+  upgrade. A failed reauthentication now preserves an already live actor and
+  reports the redacted error instead of silently disconnecting it.
 
 ### Verified
 
@@ -45,6 +52,9 @@ upstream application version.
 - Shell metadata resolution covers both macOS architectures and Linux GNU/musl
   targets. Clean-machine GUI, Overleaf login/sync, compile, and PDF-preview
   smoke tests remain release gates for a stable build.
+- Local macOS arm64 production smoke tests passed for the app-owned browser
+  reauthentication path, hosted Socket.IO v2 handshake, and the full native
+  `Local Replica Sync Demo` actor lifecycle (`live`, `connected`, no error).
 
 ## [0.1.0-alpha.1] - 2026-08-12
 

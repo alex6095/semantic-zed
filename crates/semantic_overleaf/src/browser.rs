@@ -103,16 +103,9 @@ async fn capture_browser_cookies(
     let server_url = canonical_server_url(server)?;
     let project_url = server_url.join("project")?;
     let profile = prepare_browser_profile(store, server)?;
-    let arc_is_running = is_arc_running();
-    let browser = find_browser_executable(arc_is_running).ok_or(
-        BrowserLoginError::NoCompatibleBrowser {
-            hint: if arc_is_running {
-                "Arc is already open, so Semantic Zed will not start a second Arc instance. Install or choose Chrome, Brave, Edge, or Chromium, or close Arc and retry."
-            } else {
-                "Install Chrome, Brave, Edge, or Chromium, then retry."
-            },
-        },
-    )?;
+    let browser = find_browser_executable().ok_or(BrowserLoginError::NoCompatibleBrowser {
+        hint: "Semantic Zed uses a dedicated secure browser profile for this sign-in. Install Chrome, Brave, Edge, or Chromium, then retry.",
+    })?;
     let port = reserve_loopback_port()?;
     let mut browser_process = BrowserProcess::spawn(&browser, port, &profile, &project_url)?;
     let result = wait_for_login(&mut browser_process, port, &project_url, timeout).await;
@@ -153,6 +146,11 @@ async fn wait_for_login(
     })?
     .map_err(|error| BrowserLoginError::DevTools(error.to_string()))?;
     let mut cdp = CdpClient::new(socket);
+    // Chromium normally honors the launch URL, but an OS app activation can
+    // instead expose a fresh `chrome://newtab` target. Drive the app-owned
+    // page explicitly so Connect always reaches Overleaf rather than merely
+    // opening a browser window.
+    cdp.navigate(project_url).await?;
 
     while Instant::now() < deadline {
         browser.ensure_running()?;
@@ -334,6 +332,12 @@ where
         Self { socket, next_id: 0 }
     }
 
+    async fn navigate(&mut self, url: &Url) -> Result<(), BrowserLoginError> {
+        self.call("Page.navigate", json!({ "url": url.as_str() }))
+            .await?;
+        Ok(())
+    }
+
     async fn login_state(&mut self) -> Result<Option<LoginPageState>, BrowserLoginError> {
         let response = self
             .call(
@@ -491,8 +495,8 @@ fn is_project_page(current: &str, project_url: &Url) -> bool {
     current.origin() == project_url.origin() && current.path().starts_with(project_url.path())
 }
 
-fn find_browser_executable(arc_is_running: bool) -> Option<PathBuf> {
-    browser_candidates(arc_is_running)
+fn find_browser_executable() -> Option<PathBuf> {
+    browser_candidates()
         .into_iter()
         .find(|candidate| candidate.is_file())
         .or_else(|| {
@@ -502,12 +506,11 @@ fn find_browser_executable(arc_is_running: bool) -> Option<PathBuf> {
         })
 }
 
-fn browser_candidates(arc_is_running: bool) -> Vec<PathBuf> {
+fn browser_candidates() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         let default = mac_default_browser_executable();
         let installed = [
-            "/Applications/Arc.app/Contents/MacOS/Arc",
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
             "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
@@ -515,15 +518,19 @@ fn browser_candidates(arc_is_running: bool) -> Vec<PathBuf> {
         ];
         let mut candidates = Vec::new();
         if let Some(default) = default {
-            if !(arc_is_running && is_arc_executable(&default)) {
+            // Arc's macOS launcher does not reliably create a page target when
+            // it is started with an isolated Chromium data directory and local
+            // DevTools port: it can return to its existing app instance while
+            // leaving only service workers. Do not make reauthentication
+            // depend on that unsupported path. Other supported default
+            // browsers still keep first priority.
+            if !is_arc_executable(&default) {
                 candidates.push(default);
             }
         }
         for installed in installed {
             let candidate = PathBuf::from(installed);
-            if !(arc_is_running && is_arc_executable(&candidate))
-                && !candidates.contains(&candidate)
-            {
+            if !candidates.contains(&candidate) {
                 candidates.push(candidate);
             }
         }
@@ -531,7 +538,6 @@ fn browser_candidates(arc_is_running: bool) -> Vec<PathBuf> {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = arc_is_running;
         let program_files = std::env::var_os("PROGRAMFILES").unwrap_or_default();
         let program_files_x86 = std::env::var_os("PROGRAMFILES(X86)").unwrap_or_default();
         let local_app_data = std::env::var_os("LOCALAPPDATA").unwrap_or_default();
@@ -544,7 +550,6 @@ fn browser_candidates(arc_is_running: bool) -> Vec<PathBuf> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = arc_is_running;
         Vec::new()
     }
 }
@@ -575,23 +580,6 @@ fn find_command_in_path(command: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|directory| directory.join(command))
         .find(|candidate| candidate.is_file())
-}
-
-#[cfg(target_os = "macos")]
-#[allow(clippy::disallowed_methods)]
-fn is_arc_running() -> bool {
-    Command::new("/usr/bin/pgrep")
-        .args(["-x", "Arc"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn is_arc_running() -> bool {
-    false
 }
 
 #[cfg(target_os = "macos")]
@@ -680,6 +668,16 @@ mod tests {
         assert!(!args.iter().any(|arg| arg.contains("--profile-directory")));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_login_skips_arc_but_keeps_other_default_browsers_first() {
+        assert!(
+            browser_candidates()
+                .iter()
+                .all(|candidate| !is_arc_executable(candidate))
+        );
+    }
+
     #[test]
     fn cookies_are_limited_to_the_authenticated_overleaf_origin() {
         let url = Url::parse("https://www.overleaf.com/project").unwrap();
@@ -745,6 +743,27 @@ mod tests {
                 0o700
             );
         }
+    }
+
+    /// Manual production diagnostic. It drives the same app-owned Chromium
+    /// profile and CDP navigation path as the native panel, without reading a
+    /// user's personal browser cookie store or writing credentials.
+    #[tokio::test]
+    #[ignore = "requires an existing Semantic Zed Overleaf browser session"]
+    async fn live_hosted_browser_reauthentication_smoke() {
+        let store = CredentialStore::default();
+        let cookies =
+            capture_browser_cookies("https://www.overleaf.com/", &store, Duration::from_secs(45))
+                .await
+                .expect("reuse the app-owned Overleaf browser session");
+        assert!(!cookies.is_empty());
+
+        let mut client = OverleafHttpClient::new("https://www.overleaf.com/").unwrap();
+        let identity = client
+            .login_with_cookies(&cookies)
+            .await
+            .expect("validate the reused browser session");
+        assert!(!identity.user_id.is_empty());
     }
 
     #[cfg(target_os = "macos")]

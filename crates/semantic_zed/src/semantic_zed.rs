@@ -610,6 +610,8 @@ impl PaperPanel {
             return;
         }
 
+        let was_connected = matches!(&self.login, LoginState::Connected);
+        self.project_message = None;
         self.login = LoginState::OpeningBrowser;
         cx.notify();
         let login_task = Tokio::spawn_result(cx, login_with_browser());
@@ -620,10 +622,26 @@ impl PaperPanel {
                     Ok(identity) => {
                         this.account_email = account_email(&identity);
                         this.login = LoginState::Connected;
+                        // A reauthentication may rotate the session cookies.
+                        // Recreate the actor after the new credential has been
+                        // persisted so its HTTP and realtime transports never
+                        // continue with the previous identity.
+                        this.reset_native_sync();
+                        this.clear_presence(window, cx);
                     }
-                    Err(_) => {
-                        this.account_email = None;
-                        this.login = LoginState::Failed;
+                    Err(error) => {
+                        // A failed reauthentication should not sever a
+                        // connection which was already usable. Surface the
+                        // redacted native error so users can distinguish a
+                        // browser issue from an Overleaf session expiry.
+                        if !was_connected {
+                            this.account_email = None;
+                            this.login = LoginState::Failed;
+                        } else {
+                            this.login = LoginState::Connected;
+                        }
+                        this.project_message =
+                            Some(format!("Could not complete Overleaf sign-in: {error:#}"));
                     }
                 }
                 if matches!(&this.login, LoginState::Connected) {

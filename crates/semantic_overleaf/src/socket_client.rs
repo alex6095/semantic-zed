@@ -9,11 +9,12 @@ use async_tungstenite::tungstenite::http::HeaderValue;
 use async_tungstenite::tungstenite::{Error as WebSocketError, Message};
 use futures::StreamExt as _;
 use futures::io::{AsyncRead, AsyncWrite};
+use reqwest::header::SET_COOKIE;
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use crate::http::canonical_server_url;
+use crate::http::{canonical_server_url, merge_cookie_header};
 use crate::socket_io::{
     AckMode, Packet, PacketType, SocketIoCodecError, decode_payload, encode_packet,
 };
@@ -22,8 +23,12 @@ use crate::socket_io::{
 pub enum SocketClientError {
     #[error("invalid Socket.IO origin: {0}")]
     InvalidOrigin(#[from] url::ParseError),
-    #[error("Socket.IO handshake request failed: {0}")]
-    HandshakeRequest(#[from] reqwest::Error),
+    #[error("Socket.IO handshake request failed for {url}: {source}")]
+    HandshakeRequest {
+        url: String,
+        #[source]
+        source: reqwest::Error,
+    },
     #[error("Socket.IO handshake rejected ({status}): {body}")]
     HandshakeRejected { status: u16, body: String },
     #[error("Socket.IO handshake did not offer websocket transport: {0}")]
@@ -133,18 +138,53 @@ impl SocketIo09Session {
             }
         }
 
+        // Socket.IO 0.9 is a legacy, connection-oriented transport. Keep its
+        // HTTP bootstrap on HTTP/1.1 (as browser clients do) and use the same
+        // platform certificate verifier as Zed's network client. In
+        // particular this avoids an HTTP/2 intermediary selecting a different
+        // load-balancer backend from the subsequent WebSocket upgrade.
         let http = reqwest::Client::builder()
+            .use_preconfigured_tls(http_client_tls::tls_config())
+            .http1_only()
             .redirect_policy(reqwest::redirect::Policy::none())
             .timeout(timeout)
-            .build()?;
+            .build()
+            .map_err(|source| SocketClientError::HandshakeRequest {
+                url: handshake_url.to_string(),
+                source,
+            })?;
         let response = http
             .get(handshake_url.clone())
             .header("Origin", &origin)
             .header("Cookie", cookies)
             .send()
-            .await?;
+            .await
+            .map_err(|source| SocketClientError::HandshakeRequest {
+                url: handshake_url.to_string(),
+                source,
+            })?;
         let status = response.status();
-        let body = response.text().await?;
+        // Hosted Overleaf sets a short-lived GCLB affinity cookie on this
+        // bootstrap response. A browser automatically returns it for the WSS
+        // upgrade; without doing the same, the upgrade can be routed to a
+        // backend that does not own the Socket.IO session.
+        let upgrade_cookies = merge_cookie_header(
+            cookies,
+            &response
+                .headers()
+                .get_all(SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        );
+        let body = response
+            .text()
+            .await
+            .map_err(|source| SocketClientError::HandshakeRequest {
+                url: handshake_url.to_string(),
+                source,
+            })?;
         if !status.is_success() {
             return Err(SocketClientError::HandshakeRejected {
                 status: status.as_u16(),
@@ -189,7 +229,7 @@ impl SocketIo09Session {
         );
         request.headers_mut().insert(
             "Cookie",
-            HeaderValue::from_str(cookies)
+            HeaderValue::from_str(&upgrade_cookies)
                 .map_err(|error| SocketClientError::InvalidHeader(error.to_string()))?,
         );
         let tls_connector =
@@ -416,13 +456,14 @@ fn unix_millis() -> u128 {
 mod tests {
     use std::sync::Arc;
 
-    use async_tungstenite::tokio::accept_async;
+    use async_tungstenite::tokio::{accept_async, accept_hdr_async};
     use futures::StreamExt as _;
     use serde_json::json;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
+    use crate::credentials::CredentialStore;
     use crate::socket_io::{Packet, PacketType, decode_payload, encode_packet};
 
     async fn read_http_request(stream: &mut TcpStream) -> String {
@@ -524,5 +565,87 @@ mod tests {
             .unwrap();
         assert_eq!(values[1]["rootFolder"], json!([]));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_carries_handshake_load_balancer_cookie() {
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server_listener = listener.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = server_listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            assert!(request.starts_with("GET /socket.io/1/?"));
+            let body = "sticky-session:15:60:websocket";
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nSet-Cookie: GCLB=sticky; Path=/\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let (stream, _) = server_listener.accept().await.unwrap();
+            let mut websocket = accept_hdr_async(
+                stream,
+                |request: &async_tungstenite::tungstenite::handshake::server::Request,
+                 response: async_tungstenite::tungstenite::handshake::server::Response| {
+                let cookie = request
+                    .headers()
+                    .get("Cookie")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                assert!(cookie.contains("session=active"));
+                assert!(cookie.contains("GCLB=sticky"));
+                Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            websocket
+                .send(Message::Text(
+                    encode_packet(&Packet::new(PacketType::Connect))
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let session =
+            SocketIo09Session::connect(&url, &[], "session=active", Duration::from_secs(2))
+                .await
+                .unwrap();
+        assert_eq!(session.session_id, "sticky-session");
+        session.disconnect();
+        server.await.unwrap();
+    }
+
+    /// Manual hosted-service diagnostic. It is deliberately ignored in CI and
+    /// receives the project id only from the caller's environment; it never
+    /// logs or serializes the stored cookie header.
+    #[tokio::test]
+    #[ignore = "requires a locally authenticated Overleaf account"]
+    async fn live_hosted_v2_handshake_smoke() {
+        let project_id = std::env::var("SEMANTIC_ZED_OVERLEAF_LIVE_PROJECT")
+            .expect("set SEMANTIC_ZED_OVERLEAF_LIVE_PROJECT to a disposable project id");
+        let identity = CredentialStore::default()
+            .load("https://www.overleaf.com/")
+            .expect("load saved Overleaf credential")
+            .expect("saved Overleaf credential");
+
+        let session = SocketIo09Session::connect(
+            "https://www.overleaf.com/",
+            &[("projectId", project_id)],
+            &identity.identity.cookies,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("hosted Socket.IO v2 handshake");
+        session.disconnect();
     }
 }
