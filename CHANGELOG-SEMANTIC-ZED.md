@@ -12,6 +12,8 @@ upstream application version.
   Windows x86_64, and Linux x86_64. Each package embeds a SHA-256-verified
   PDFium library and its license notices; CI fails if the package layout is
   missing that native renderer.
+- Fixed prerelease publication to name the GitHub repository explicitly when
+  the artifact-only promotion job has no checkout.
 - Gave Semantic Zed its own application identity, user-data directories,
   Linux desktop entry, Windows installer name, and CLI name so it can coexist
   with upstream Zed.
@@ -34,12 +36,15 @@ upstream application version.
 - `cargo test -p semantic_zed --lib`: 13 passed, 1 packaging-only PDFium test
   ignored.
 - Signed macOS arm64 development bundle built and remained running.
+- The `semantic-zed-v0.1.0-alpha.1` package jobs passed on macOS Apple
+  Silicon, Windows x86_64, and Linux x86_64, including bundle-layout checks for
+  PDFium and license notices.
 - Semantic Light sidebar and account popover inspected in the native GPUI app at
   a 296 px sidebar width. A fresh compact-layout Dark/minimum-width screenshot
   remains pending.
 - Shell metadata resolution covers both macOS architectures and Linux GNU/musl
-  targets. Windows, Linux, and macOS package jobs remain release gates until
-  their first GitHub Actions run and clean-machine smoke tests finish.
+  targets. Clean-machine GUI, Overleaf login/sync, compile, and PDF-preview
+  smoke tests remain release gates for a stable build.
 
 ## [0.1.0-alpha.1] - 2026-08-12
 
@@ -73,6 +78,6 @@ Source milestone; no notarized public binary has been released.
 ### Release boundary
 
 - Verified locally on macOS arm64 with a development signing identity.
-- Cross-platform package scripts and artifact CI are committed, but the first
-  Windows/Linux CI run, PDFium redistribution review, Apple notarization, and
-  public release tag remain pending.
+- Published as an unsigned GitHub prerelease after all three platform package
+  jobs passed. PDFium redistribution review, clean-machine functional smoke
+  tests, Apple notarization, and Windows signing remain pending.
